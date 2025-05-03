@@ -3,17 +3,17 @@ from typing import List, Literal
 from datetime import date
 
 class TimeWindow(BaseModel):
-    start: str    # "HH:MM"
-    end: str      # "HH:MM"
+    start: str    
+    end: str      
 
 class AvailabilityRequest(BaseModel):
-    requested_date: str       # "YYYY-MM-DD"
-    requested_start: str      # "HH:MM"
-    requested_end: str        # "HH:MM"
+    requested_date: str       
+    requested_start: str      
+    requested_end: str        
     required_test_type: str
-    required_nurses: int      # NEW
-    required_operation_rooms: int  # NEW
-    time_constraint_type: Literal["exact", "overlap"] = "overlap"  # NEW
+    required_nurses: int      
+    required_operation_rooms: int  
+    time_constraint_type: Literal["exact", "overlap"] = "overlap"  
 
 class Resource(BaseModel):
     id: str
@@ -34,13 +34,13 @@ class AvailabilityResponse(BaseModel):
     equipment_available: List[Resource]
     operation_theatres_available: List[Resource]
     latest_test_scores: List[TestScore]
-    match_status: str  # NEW
+    match_status: str  
 
-# MongoDB Document Models
+
 class StaffDocument(BaseModel):
     name: str
     role: Literal["radiologist", "assistant_doctor"]
-    working_hours: List[dict]  # List of {day_of_week: int, start: str, end: str}
+    working_hours: List[dict]  
 
 class NurseAvailabilityDocument(BaseModel):
     nurse_id: str
