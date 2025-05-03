@@ -1,31 +1,39 @@
 from pydantic import BaseModel
-from typing import List, Literal
+from typing import List, Literal, Optional
 from datetime import date
 
 class TimeWindow(BaseModel):
-    start: str    
-    end: str      
+    day_of_week: int
+    start: str
+    end: str
 
 class AvailabilityRequest(BaseModel):
-    requested_date: str       
-    requested_start: str      
-    requested_end: str        
+    requested_date: str
+    requested_start: str
+    requested_end: str
     required_test_type: str
-    required_nurses: int      
-    required_operation_rooms: int  
-    time_constraint_type: Literal["exact", "overlap"] = "overlap"  
+    required_radiologists: int
+    required_assistant_doctors: int
+    required_nurses: int
+    required_operation_rooms: int
+    required_equipment: Optional[str] = None
+    time_constraint_type: Literal["exact", "overlap"] = "overlap"
 
 class Resource(BaseModel):
     id: str
     name: str
+    email: Optional[str] = None
+
+    class Config:
+        exclude_none = True
 
 class TestScore(BaseModel):
     patient_id: str
-    test_type: str
     score: float
+    date: date
 
 class AvailabilityResponse(BaseModel):
-    date: str
+    date: str   
     start: str
     end: str
     radiologists_available: List[Resource]
@@ -34,16 +42,20 @@ class AvailabilityResponse(BaseModel):
     equipment_available: List[Resource]
     operation_theatres_available: List[Resource]
     latest_test_scores: List[TestScore]
-    match_status: str  
+    match_status: str
 
 
 class StaffDocument(BaseModel):
+    _id: str
     name: str
     role: Literal["radiologist", "assistant_doctor"]
-    working_hours: List[dict]  
+    email: str
+    working_hours: List[TimeWindow]
 
 class NurseAvailabilityDocument(BaseModel):
     nurse_id: str
+    nurse_name: str
+    nurse_email: str
     date: date
     start: str
     end: str
@@ -64,4 +76,14 @@ class TestHistoryDocument(BaseModel):
     patient_id: str
     test_type: str
     score: float
-    date: date 
+    date: date
+
+class Contact(BaseModel):
+    role: str
+    name: str
+    email: str
+
+class PublishPayload(BaseModel):
+    patient_id: str
+    contacts: List[Contact]
+    ot_id: Optional[str]      
