@@ -137,26 +137,23 @@ import React, { useState } from "react";
 
 const statusStyles = {
   completed: {
-    bg: "bg-green-100",
-    text: "text-green-800",
+    bg: "bg-emerald-50",
+    text: "text-emerald-700",
     label: "Completed",
-    icon: "✅",
   },
   in_progress: {
-    bg: "bg-yellow-100",
-    text: "text-yellow-800",
-    label: "In Progress",
-    icon: "🕐",
+    bg: "bg-blue-50",
+    text: "text-blue-700",
+    label: "In progress",
   },
   pending: {
-    bg: "bg-red-100",
-    text: "text-red-800",
+    bg: "bg-slate-100",
+    text: "text-slate-600",
     label: "Pending",
-    icon: "🔴",
   },
 };
 
-const Task = ({ category, data, onEdit }) => {
+const Task = ({ category, data, onEdit, onStaffEdit, onTaskEdit }) => {
   const [selectedTask, setSelectedTask] = useState(null);
 
   return (
@@ -174,7 +171,7 @@ const Task = ({ category, data, onEdit }) => {
       </div>
 
       {Object.entries(data).map(([staff, tasks], idx) => (
-        <div key={idx} className="mb-6">
+        <div key={staff || idx} className="mb-6">
           <p className="text-sm font-semibold text-blue-700 mb-2">{staff}</p>
           <div className="flex flex-col gap-2">
             {tasks.map((task, tIdx) => {
@@ -182,19 +179,30 @@ const Task = ({ category, data, onEdit }) => {
               return (
                 <div
                   key={tIdx}
-                  onClick={() => setSelectedTask(task)}
-                  className="cursor-pointer flex items-center justify-between bg-gray-50 border border-gray-200 rounded-lg px-4 py-2 hover:bg-gray-100 transition"
+                  className="flex items-center justify-between gap-3 rounded-lg bg-gray-50 border border-gray-200 px-4 py-2 hover:bg-gray-100 transition"
                 >
-                  <div>
+                  <button
+                    type="button"
+                    onClick={() => onTaskEdit?.(staff, task)}
+                    className="text-xs text-emerald-600 hover:text-emerald-500"
+                  >
+                    Edit
+                  </button>
+                  <div className="flex flex-1 flex-col gap-1">
                     <p className="text-sm text-gray-800">{task.label}</p>
-                    {task.time && (
-                      <p className="text-xs text-gray-500">{task.time}</p>
-                    )}
+                    <div className="flex flex-wrap gap-2 text-xs text-gray-500">
+                      {task.time && <span>{task.time}</span>}
+                      {task.note && <span className="text-gray-400">{task.note}</span>}
+                      {task.priority && (
+                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
+                          Priority: {task.priority}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <span
-                    className={`text-xs font-medium px-2 py-1 rounded-full inline-flex items-center gap-1 ${style.bg} ${style.text}`}
+                    className={`text-xs font-medium px-3 py-1 rounded-full ${style.bg} ${style.text}`}
                   >
-                    <span>{style.icon}</span>
                     {style.label}
                   </span>
                 </div>

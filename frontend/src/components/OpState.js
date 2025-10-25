@@ -61,14 +61,140 @@ const publishPayloadTemplate = {
 
 const initialNurseNames = ["Susan", "Elizabeth"];
 const initialNurseTasks = buildNurseTaskMap(initialNurseNames);
+const PRIORITY_OPTIONS = ["Routine", "High", "Critical"];
+
+const normalizeSuggestions = (data) => {
+    const wrap = (list = [], prefix) =>
+        list.map((item, index) => {
+            const baseName =
+                item.name ||
+                item.nurse_name ||
+                item.email ||
+                item.equipment_name ||
+                item.ot_id ||
+                `${prefix}-${index + 1}`;
+            return {
+                ...item,
+                id: item.id || `${prefix}-${index}-${baseName}`,
+                name: baseName,
+            };
+        });
+
+    return {
+        nurses: wrap(data?.nurses_available, "nurse"),
+        assistantDoctors: wrap(data?.assistant_doctors_available, "assistant"),
+        radiologists: wrap(data?.radiologists_available, "radiologist"),
+        equipment: wrap(data?.equipment_available, "equipment"),
+        operationTheatres: wrap(data?.operation_theatres_available, "ot"),
+        tests: data?.latest_test_scores || [],
+        meta: {
+            date: data?.date,
+            start: data?.start,
+            end: data?.end,
+            matchStatus: data?.match_status,
+        },
+    };
+};
+
+const formatPlan = (plan) => {
+    if (!plan) return null;
+    return {
+        summary: plan.surgical_plan_summary,
+        urgency: plan.urgency_level,
+        tests: plan.suggested_tests || [],
+        steps: [
+            {
+                id: "prep-consent",
+                title: "Confirm informed consent",
+                detail: "Reconfirm consent and allergies prior to incision.",
+                suggestedRole: "Assistant Doctor",
+            },
+            {
+                id: "verify-blood",
+                title: "Verify blood products",
+                detail: "Ensure cross-matched units are on standby.",
+                suggestedRole: "Nurse",
+            },
+            {
+                id: "review-imaging",
+                title: "Review surgical imaging",
+                detail: "Review most recent CT scans with surgical team.",
+                suggestedRole: "Radiologist",
+            },
+            {
+                id: "postop-brief",
+                title: "Schedule PACU briefing",
+                detail: "Coordinate immediate post-op handoff to PACU lead.",
+                suggestedRole: "Assistant Doctor",
+            },
+        ],
+    };
+};
+
+const suggestionCategories = [
+    { key: "nurses", label: "Nurses", target: "nurse" },
+    { key: "assistantDoctors", label: "Assistant Doctors", target: "doctor" },
+    { key: "radiologists", label: "Radiologists", target: "doctor" },
+    { key: "equipment", label: "Equipment", target: "equipment" },
+    { key: "operationTheatres", label: "Operating Rooms", target: "ot" },
+];
+
+const deriveMatchStatus = (suggestions) => {
+    if (!suggestions) {
+        return { message: "Awaiting AI data", success: null, missing: [] };
+    }
+
+    const backendStatus = suggestions.meta?.matchStatus;
+    if (backendStatus) {
+        const normalized = backendStatus.toLowerCase();
+        return {
+            message: backendStatus,
+            success: normalized.includes("matched"),
+            missing: [],
+        };
+    }
+
+    const requirements = defaultAvailabilityPayload;
+    const missing = [];
+
+    if ((suggestions.nurses || []).length < requirements.required_nurses) {
+        missing.push("Nurses");
+    }
+    if ((suggestions.assistantDoctors || []).length < requirements.required_assistant_doctors) {
+        missing.push("Assistant doctors");
+    }
+    if ((suggestions.radiologists || []).length < requirements.required_radiologists) {
+        missing.push("Radiologists");
+    }
+    if ((suggestions.operationTheatres || []).length < requirements.required_operation_rooms) {
+        missing.push("Operating rooms");
+    }
+    if (
+        requirements.required_equipment &&
+        !(suggestions.equipment || []).some(
+            (item) => item.name?.toLowerCase() === requirements.required_equipment.toLowerCase()
+        )
+    ) {
+        missing.push(`Equipment: ${requirements.required_equipment}`);
+    }
+
+    return {
+        message: missing.length ? "Requirements not met" : "Requirements matched",
+        success: missing.length === 0,
+        missing,
+    };
+};
 
 const OpState = ({ token }) => {
     const [activeTab, setActiveTab] = useState("preop");
     const [nurseTasks, setNurseTasks] = useState(initialNurseTasks);
-    const [aiData, setAiData] = useState(null);
+    const [aiSuggestions, setAiSuggestions] = useState(null);
     const [aiError, setAiError] = useState("");
+    const [aiPlan, setAiPlan] = useState(null);
+    const [matchStatus, setMatchStatus] = useState(null);
+    const [selectedCrewForSuggestion, setSelectedCrewForSuggestion] = useState({});
+    const [selectedPlanTasks, setSelectedPlanTasks] = useState({});
     const [loading, setLoading] = useState(false);
-    const [llmData, setLlmData] = useState(null);
     const [publishResponse, setPublishResponse] = useState(null);
     const [showPublishModal, setShowPublishModal] = useState(false);
     const [doctorTasksPreOp, setDoctorTasksPreOp] = useState({
@@ -87,6 +213,7 @@ const OpState = ({ token }) => {
         status: "pending",
         time: "",
         note: "",
+        priority: "Routine",
     });
     const [taskFormError, setTaskFormError] = useState("");
     const [useCustomStaff, setUseCustomStaff] = useState(false);
@@ -99,6 +226,7 @@ const OpState = ({ token }) => {
     const [crewError, setCrewError] = useState("");
     const [toast, setToast] = useState(null);
     const toastTimeoutRef = useRef(null);
+    const [editingTaskContext, setEditingTaskContext] = useState(null);
 
     useEffect(() => {
         return () => {
@@ -126,42 +254,190 @@ const OpState = ({ token }) => {
     );
     const nurses = useMemo(() => Object.keys(nurseTasks), [nurseTasks]);
     const availableDoctorOptions = useMemo(() => {
-        const radiologists = aiData?.radiologists_available || [];
-        const assistants = aiData?.assistant_doctors_available || [];
-        const combined = [...radiologists, ...assistants]
+        const aiNames = [
+            ...(aiSuggestions?.assistantDoctors || []),
+            ...(aiSuggestions?.radiologists || []),
+        ]
             .map((entry) => entry?.name?.trim())
             .filter(Boolean);
-        const current = doctorNameSuggestions;
-        const merged = Array.from(new Set([...combined, ...current]));
+        const merged = Array.from(new Set([...aiNames, ...doctorNameSuggestions]));
         return merged;
-    }, [aiData, doctorNameSuggestions]);
+    }, [aiSuggestions, doctorNameSuggestions]);
 
     const availableNurseOptions = useMemo(() => {
-        const list = aiData?.nurses_available || [];
-        const fromAvailability = list.map((entry) => entry?.name?.trim()).filter(Boolean);
-        const merged = Array.from(new Set([...fromAvailability, ...nurses]));
+        const aiNames = (aiSuggestions?.nurses || [])
+            .map((entry) => entry?.name?.trim())
+            .filter(Boolean);
+        const merged = Array.from(new Set([...aiNames, ...nurses]));
         return merged;
-    }, [aiData, nurses]);
+    }, [aiSuggestions, nurses]);
+
+    const hasSelectedResources = useMemo(
+        () =>
+            Object.values(selectedCrewForSuggestion).some(
+                (ids) => Array.isArray(ids) && ids.length > 0
+            ),
+        [selectedCrewForSuggestion]
+    );
+
+    const setSuggestions = (nextOrUpdater) => {
+        setAiSuggestions((prev) => {
+            const next = typeof nextOrUpdater === "function" ? nextOrUpdater(prev) : nextOrUpdater;
+            setMatchStatus(deriveMatchStatus(next));
+            return next;
+        });
+    };
+
     const handleFetchAISuggestions = async () => {
         setLoading(true);
         setAiError("");
         try {
             const data = await requestAvailability(defaultAvailabilityPayload, token);
-            setAiData(data);
+            const normalized = normalizeSuggestions(data);
+            setSuggestions(normalized);
 
             const llmRes = await fetch("/files/ai.json");
             if (llmRes.ok) {
                 const llmJson = await llmRes.json();
-                setLlmData(llmJson);
+                setAiPlan(formatPlan(llmJson));
             } else {
-                setLlmData(null);
+                setAiPlan(null);
             }
+
+            setSelectedCrewForSuggestion({});
+            setSelectedPlanTasks({});
         } catch (err) {
             console.error("AI Suggestion fetch failed:", err);
-            setAiData(null);
+            setSuggestions(null);
+            setAiPlan(null);
             setAiError(err.message || "Failed to load suggestions.");
         } finally {
             setLoading(false);
+        }
+    };
+
+    const toggleResourceSelection = (category, id) => {
+        setSelectedCrewForSuggestion((prev) => {
+            const current = new Set(prev[category] || []);
+            current.has(id) ? current.delete(id) : current.add(id);
+            return { ...prev, [category]: Array.from(current) };
+        });
+    };
+
+    const handleResourceEdit = (category, resource) => {
+        const nextName = window.prompt("Update name", resource.name);
+        const trimmed = nextName?.trim();
+        if (!trimmed) {
+            return;
+        }
+        setSuggestions((prev) => {
+            if (!prev) return prev;
+            const updatedCategory = prev[category]?.map((item) =>
+                item.id === resource.id ? { ...item, name: trimmed } : item
+            );
+            return { ...prev, [category]: updatedCategory };
+        });
+    };
+
+    const handleResourceRemove = (category, id) => {
+        setSuggestions((prev) => {
+            if (!prev) return prev;
+            return {
+                ...prev,
+                [category]: prev[category]?.filter((item) => item.id !== id),
+            };
+        });
+        setSelectedCrewForSuggestion((prev) => {
+            if (!prev[category]) return prev;
+            const filtered = prev[category].filter((itemId) => itemId !== id);
+            return { ...prev, [category]: filtered };
+        });
+    };
+
+    const assignTaskToOwner = (ownerName, task, type) => {
+        if (!ownerName) return;
+        if (type === "nurse") {
+            setNurseTasks((prev) => {
+                const updated = { ...prev };
+                if (!updated[ownerName]) {
+                    updated[ownerName] = [];
+                }
+                updated[ownerName] = [...updated[ownerName], task];
+                return updated;
+            });
+        } else {
+            setDoctorTasksPreOp((prev) => {
+                const updated = { ...prev };
+                if (!updated[ownerName]) {
+                    updated[ownerName] = [];
+                }
+                updated[ownerName] = [...updated[ownerName], task];
+                return updated;
+            });
+        }
+    };
+
+    const handleApplySelectedResources = () => {
+        if (!aiSuggestions) return;
+        let applied = 0;
+
+        suggestionCategories.forEach(({ key, label, target }) => {
+            const selectedIds = selectedCrewForSuggestion[key] || [];
+            if (!selectedIds.length) return;
+            selectedIds.forEach((id) => {
+                const resource = aiSuggestions[key]?.find((item) => item.id === id);
+                if (!resource) return;
+                const ownerName =
+                    target === "nurse"
+                        ? resource.name
+                        : target === "doctor"
+                        ? resource.name
+                        : "Logistics Coordinator";
+                const task = {
+                    label: `Coordinate ${label.toLowerCase()} – ${resource.name}`,
+                    status: "pending",
+                    note: target === "nurse" ? "Assigned via AI suggestion" : undefined,
+                    priority: "Routine",
+                };
+                assignTaskToOwner(ownerName, task, target === "nurse" ? "nurse" : "doctor");
+                applied += 1;
+            });
+        });
+
+        if (applied > 0) {
+            showToast(`Added ${applied} task${applied > 1 ? "s" : ""} from AI suggestions.`, "success");
+            setSelectedCrewForSuggestion({});
+        } else {
+            showToast("Select team members to add tasks.", "error");
+        }
+    };
+
+    const handlePlanTaskSelection = (stepId, assignee) => {
+        setSelectedPlanTasks((prev) => ({ ...prev, [stepId]: assignee }));
+    };
+
+    const handleApplyPlanSteps = () => {
+        if (!aiPlan?.steps?.length) return;
+        let applied = 0;
+        aiPlan.steps.forEach((step) => {
+            const assignee = selectedPlanTasks[step.id];
+            if (!assignee) return;
+            const task = {
+                label: step.title,
+                status: "pending",
+                note: step.detail,
+                priority: "High",
+            };
+            const isNurse = Object.prototype.hasOwnProperty.call(nurseTasks, assignee);
+            assignTaskToOwner(assignee, task, isNurse ? "nurse" : "doctor");
+            applied += 1;
+        });
+
+        if (applied > 0) {
+            showToast(`Added ${applied} plan step${applied > 1 ? "s" : ""} to tasks.`, "success");
+            setSelectedPlanTasks({});
+        } else {
+            showToast("Select and assign plan steps before adding.", "error");
         }
     };
 
@@ -292,6 +568,7 @@ const OpState = ({ token }) => {
             status: "pending",
             time: "",
             note: "",
+            priority: "Routine",
         });
         setTaskFormError("");
         setUseCustomStaff(false);
@@ -310,6 +587,7 @@ const OpState = ({ token }) => {
             status: "pending",
             time: "",
             note: "",
+            priority: "Routine",
         });
     };
 
@@ -318,6 +596,36 @@ const OpState = ({ token }) => {
             ...prev,
             [field]: value,
         }));
+    };
+
+    const openTaskModalForStaff = (staffName, type) => {
+        setTaskForm({
+            staff: staffName,
+            label: "",
+            status: "pending",
+            time: "",
+            note: "",
+            priority: "Routine",
+        });
+        setUseCustomStaff(false);
+        setCustomStaffName("");
+        setTaskFormError("");
+        setShowTaskModal(true);
+    };
+
+    const openTaskEditModal = (staffName, task, type) => {
+        setTaskForm({
+            staff: staffName,
+            label: task.label || "",
+            status: task.status || "pending",
+            time: task.time || "",
+            note: task.note || "",
+            priority: task.priority || "Routine",
+        });
+        setUseCustomStaff(false);
+        setCustomStaffName("");
+        setTaskFormError("");
+        setShowTaskModal(true);
     };
 
     const handleTaskSubmit = (event) => {
@@ -329,6 +637,7 @@ const OpState = ({ token }) => {
         const status = taskForm.status;
         const time = taskForm.time;
         const note = taskForm.note.trim();
+        const priority = taskForm.priority || "Routine";
 
         if (!staff) {
             setTaskFormError("Please specify who should own this task.");
@@ -348,6 +657,7 @@ const OpState = ({ token }) => {
         const newTask = {
             label,
             status,
+            priority,
         };
 
         if (time) {
@@ -429,94 +739,171 @@ const OpState = ({ token }) => {
 
                         {loading && <p className="text-sm text-gray-500 mb-6">Loading...</p>}
 
-                        {!aiData && !llmData && !loading && (
+                        {!aiPlan && !aiSuggestions && !loading && (
                             <p className="text-sm text-gray-500 mb-6">Suggestions will appear here...</p>
                         )}
 
-                        {llmData && (
-                            <div className="bg-indigo-50 p-4 rounded-lg border space-y-2">
-                                <h4 className="font-semibold text-indigo-700 text-sm mb-1">🤖 AI Surgical Plan</h4>
-                                <p className="text-sm"><strong>Summary:</strong> {llmData.surgical_plan_summary}</p>
-                                <p className="text-sm"><strong>Urgency Level:</strong> {llmData.urgency_level}</p>
-                                <div>
-                                    <strong className="text-sm">Suggested Tests:</strong>
-                                    <div className="flex flex-wrap gap-2 mt-1">
-                                        {llmData.suggested_tests.map((test, i) => (
-                                            <span
-                                                key={i}
-                                                className="px-2 py-1 bg-white border border-indigo-100 text-gray-700 text-xs rounded-full shadow-sm"
-                                            >
-                                                {test}
-                                            </span>
-                                        ))}
+                        {aiPlan && (
+                            <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                <div className="flex items-center justify-between">
+                                    <div>
+                                        <h4 className="text-sm font-semibold text-slate-900">AI Surgical Plan</h4>
+                                        <p className="text-xs text-slate-400">Urgency: {aiPlan.urgency}</p>
                                     </div>
+                                    {aiPlan.tests?.length > 0 && (
+                                        <div className="flex flex-wrap gap-2">
+                                            {aiPlan.tests.map((test) => (
+                                                <span
+                                                    key={test}
+                                                    className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500"
+                                                >
+                                                    {test}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                                <p className="mt-3 text-sm text-slate-600">{aiPlan.summary}</p>
+                                <div className="mt-4 space-y-3">
+                                    {aiPlan.steps.map((step) => (
+                                        <div key={step.id} className="flex flex-col gap-2 rounded-2xl border border-slate-100 bg-slate-50 px-3 py-3">
+                                            <div className="flex items-center justify-between gap-3">
+                                                <div>
+                                                    <p className="text-sm font-medium text-slate-900">{step.title}</p>
+                                                    <p className="text-xs text-slate-400">Suggested: {step.suggestedRole}</p>
+                                                </div>
+                                                <select
+                                                    value={selectedPlanTasks[step.id] || ""}
+                                                    onChange={(e) => handlePlanTaskSelection(step.id, e.target.value)}
+                                                    className="rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                                                >
+                                                    <option value="">Assign</option>
+                                                    {assigneeOptions.map((option) => (
+                                                        <option key={option} value={option}>
+                                                            {option}
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                            </div>
+                                            <p className="text-xs text-slate-500">{step.detail}</p>
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="mt-4 flex justify-end">
+                                    <button
+                                        type="button"
+                                        onClick={handleApplyPlanSteps}
+                                        className="rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow hover:bg-emerald-500"
+                                    >
+                                        Add selected steps
+                                    </button>
                                 </div>
                             </div>
                         )}
 
-                        {aiData && !aiError && (
+                        {aiSuggestions && !aiError && (
                             <div className="space-y-4">
-                                <div className="bg-white rounded-lg border shadow-sm p-4">
-                                    <div className="font-semibold text-xs text-gray-500 uppercase mb-1">Date & Time</div>
-                                    <div className="flex flex-col gap-1 text-sm text-gray-700">
-                                        <div className="flex items-center gap-2">📅 {aiData.date}</div>
-                                        <div className="flex items-center gap-2">⏰ {aiData.start} – {aiData.end}</div>
+                                <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                    <div className="font-semibold text-xs uppercase tracking-wide text-slate-400">
+                                        Window
+                                    </div>
+                                    <div className="mt-2 text-sm text-slate-600">
+                                        <p>📅 {aiSuggestions.meta?.date}</p>
+                                        <p>⏰ {aiSuggestions.meta?.start} – {aiSuggestions.meta?.end}</p>
                                     </div>
                                 </div>
 
-                                {[
-                                    { title: "Nurses", list: aiData.nurses_available },
-                                    { title: "Assistant Doctors", list: aiData.assistant_doctors_available },
-                                    { title: "Radiologists", list: aiData.radiologists_available },
-                                    { title: "Equipment", list: aiData.equipment_available },
-                                    { title: "Operation Theatres", list: aiData.operation_theatres_available },
-                                ].map(({ title, list }, index) => (
-                                    <div key={index} className="bg-white rounded-lg border shadow-sm p-4">
-                                        <div className="font-semibold text-xs text-gray-500 uppercase mb-2">{title}</div>
-                                        <div className="grid grid-cols-1 gap-1 text-gray-700 text-sm">
-                                            {list?.map((item, i) => (
-                                                <div key={i} className="flex items-center justify-between py-2 px-2 bg-gray-50 rounded-md border border-gray-100">
-                                                    <div className="flex items-center gap-2">
-                                                        <input type="checkbox" className="form-checkbox h-4 w-4 text-blue-600" />
-                                                        <div>
-                                                            <div className="font-medium">{item.name}</div>
-                                                            {item.email && <div className="text-xs text-gray-500">{item.email}</div>}
+                                {suggestionCategories.map(({ key, label }) => {
+                                    const list = aiSuggestions[key] || [];
+                                    if (!list.length) return null;
+                                    const selectedIds = new Set(selectedCrewForSuggestion[key] || []);
+                                    return (
+                                        <div key={key} className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                            <div className="flex items-center justify-between">
+                                                <p className="text-xs uppercase tracking-wide text-slate-400">{label}</p>
+                                                {selectedIds.size > 0 && (
+                                                    <span className="text-xs text-emerald-600">{selectedIds.size} selected</span>
+                                                )}
+                                            </div>
+                                            <div className="mt-3 space-y-2">
+                                                {list.map((item) => (
+                                                    <div
+                                                        key={item.id}
+                                                        className="flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm text-slate-700"
+                                                    >
+                                                        <label className="flex flex-1 items-center gap-2">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={selectedIds.has(item.id)}
+                                                                onChange={() => toggleResourceSelection(key, item.id)}
+                                                                className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                                            />
+                                                            <div>
+                                                                <p className="font-medium text-slate-900">{item.name}</p>
+                                                                {item.email && (
+                                                                    <p className="text-xs text-slate-400">{item.email}</p>
+                                                                )}
+                                                            </div>
+                                                        </label>
+                                                        <div className="flex items-center gap-3 text-xs">
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleResourceEdit(key, item)}
+                                                                className="text-emerald-600 hover:text-emerald-500"
+                                                            >
+                                                                Edit
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleResourceRemove(key, item.id)}
+                                                                className="text-red-500 hover:text-red-400"
+                                                            >
+                                                                Remove
+                                                            </button>
                                                         </div>
                                                     </div>
-                                                    <div className="flex items-center gap-2 text-xs text-blue-600 font-medium cursor-pointer">
-                                                        <span>Edit</span>
-                                                        <span>Remove</span>
-                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+
+                                {aiSuggestions.tests?.length > 0 && (
+                                    <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                        <p className="text-xs uppercase tracking-wide text-slate-400">Latest MRI Tests</p>
+                                        <div className="mt-3 space-y-2 text-xs text-slate-500">
+                                            {aiSuggestions.tests.map((test, index) => (
+                                                <div key={index} className="flex justify-between">
+                                                    <span className="font-medium text-slate-700">{test.patient_id}</span>
+                                                    <span>{test.score}</span>
                                                 </div>
                                             ))}
                                         </div>
-
                                     </div>
-                                ))}
+                                )}
 
-                                <div className="bg-white rounded-lg border shadow-sm p-4">
-                                    <div className="font-semibold text-xs text-gray-500 uppercase mb-2">
-                                        Latest MRI Test Scores
-                                    </div>
-                                    <div className="space-y-1 text-gray-700 text-sm">
-                                        {aiData.latest_test_scores?.map((s, i) => (
-                                            <div key={i} className="flex justify-between">
-                                                <span className="font-medium">{s.patient_id}</span>
-                                                <span>{s.score}</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-
-                                <div
-                                    className={`text-center font-semibold text-sm px-3 py-2 rounded-md border shadow-sm ${aiData.match_status === "Requirements matched"
-                                            ? "bg-green-50 text-green-700 border-green-200"
-                                            : "bg-red-50 text-red-600 border-red-200"
+                                {matchStatus && (
+                                    <div
+                                        className={`rounded-3xl border px-4 py-3 text-center text-sm font-semibold shadow-sm ${
+                                            matchStatus.success === null
+                                                ? "border-slate-200 bg-slate-50 text-slate-500"
+                                                : matchStatus.success
+                                                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                                : "border-red-200 bg-red-50 text-red-600"
                                         }`}
-                                >
-                                    {aiData.match_status === "Requirements matched" ? "✅" : "❌"} {aiData.match_status}
-                                </div>
-
+                                    >
+                                        <p className="font-semibold">
+                                            {matchStatus.success === null
+                                                ? matchStatus.message
+                                                : `${matchStatus.success ? "✅" : "❌"} ${matchStatus.message}`}
+                                        </p>
+                                        {!matchStatus.success && matchStatus.missing?.length > 0 && (
+                                            <p className="mt-1 text-xs font-normal text-slate-500">
+                                                Needs: {matchStatus.missing.join(", ")}
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
                             </div>
                         )}
 
@@ -533,7 +920,11 @@ const OpState = ({ token }) => {
                         >
                             AI Suggestion
                         </button>
-                        <button className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium py-2 px-4 rounded-full shadow">
+                        <button
+                            onClick={handleApplySelectedResources}
+                            disabled={!hasSelectedResources}
+                            className={`text-white text-sm font-medium py-2 px-4 rounded-full shadow transition ${hasSelectedResources ? "bg-blue-600 hover:bg-blue-700" : "bg-blue-300 cursor-not-allowed"}`}
+                        >
                             Add to Task
                         </button>
                     </div>
@@ -565,8 +956,14 @@ const OpState = ({ token }) => {
                     <Task
                         category="Nurses"
                         data={nurseTasks}
+                        onStaffEdit={(staffName) => openTaskModalForStaff(staffName, "nurse")}
+                        onTaskEdit={(staffName, task) => openTaskEditModal(staffName, task, "nurse")}
                     />
-                    <Task category="Assistant Doctors" data={doctorTasksPreOp} />
+                    <Task
+                        category="Assistant Doctors"
+                        data={doctorTasksPreOp}
+                        onTaskEdit={(staffName, task) => openTaskEditModal(staffName, task, "doctor")}
+                    />
 
                     {/* ✅ Publish Button */}
                     <div className="mt-8 flex justify-end">
