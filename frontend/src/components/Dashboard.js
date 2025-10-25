@@ -1,18 +1,45 @@
 import React from "react";
+import PatientCard from "./PatientCard";
 
-const Dashboard = ({ onCaseClick }) => {
+const Dashboard = ({ onCaseClick, user }) => {
+  const displayName =
+    (user?.full_name && `Dr. ${user.full_name}`) ||
+    (user?.email && `Dr. ${user.email.split("@")[0]}`) ||
+    "Care Team";
+
+  const patients = [
+    {
+      name: "Jacob",
+      case: "Lung Surgery",
+      date: "Today",
+      status: "Pre-Op",
+      statusColor: "yellow",
+    },
+    {
+      name: "Emily",
+      case: "Knee Replacement",
+      date: "Tomorrow",
+      status: "Pending",
+      statusColor: "blue",
+    },
+    {
+      name: "Carlos",
+      case: "Heart Valve",
+      date: "Next Week",
+      status: "Scheduled",
+      statusColor: "green",
+    },
+  ];
+
   return (
-    <div className="p-4">
-      <h1 className="text-3xl font-bold mb-6">Welcome Dr. JD</h1>
-      <div
-        onClick={onCaseClick}
-        className="bg-white rounded-xl shadow-md hover:shadow-lg transition cursor-pointer p-6 border-l-4 border-blue-500"
-      >
-        <h2 className="text-xl font-semibold">Jacob – Lung Surgery</h2>
-        <p className="text-sm text-gray-600 mt-2">Scheduled: Today</p>
-        <span className="inline-block mt-2 px-2 py-1 bg-yellow-100 text-yellow-800 rounded-full text-xs font-medium">
-          Pre-Op
-        </span>
+    <div>
+      <h1 className="mb-8 text-3xl font-bold text-gray-800">
+        Welcome {displayName}
+      </h1>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {patients.map((patient, idx) => (
+          <PatientCard key={idx} patient={patient} onClick={onCaseClick} />
+        ))}
       </div>
     </div>
   );

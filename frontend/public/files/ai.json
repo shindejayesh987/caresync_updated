@@ -1,0 +1,5 @@
+{
+  "surgical_plan_summary": "Start with CT scan and follow up with MRI.",
+  "suggested_tests": ["CT Scan", "MRI"],
+  "urgency_level": "High"
+}
