@@ -163,12 +163,14 @@ const Task = ({ category, data, onEdit }) => {
     <div className="mb-10">
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-md font-semibold text-gray-800">{category}</h3>
-        <button
-          onClick={onEdit}
-          className="text-sm text-gray-500 hover:text-gray-700 border border-gray-300 rounded-full px-3 py-1"
-        >
-          Edit Staff
-        </button>
+        {onEdit && (
+          <button
+            onClick={onEdit}
+            className="text-sm text-gray-500 hover:text-gray-700 border border-gray-300 rounded-full px-3 py-1"
+          >
+            Edit Staff
+          </button>
+        )}
       </div>
 
       {Object.entries(data).map(([staff, tasks], idx) => (

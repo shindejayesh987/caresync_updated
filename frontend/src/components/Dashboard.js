@@ -1,7 +1,12 @@
 import React from "react";
 import PatientCard from "./PatientCard";
 
-const Dashboard = ({ onCaseClick }) => {
+const Dashboard = ({ onCaseClick, user }) => {
+  const displayName =
+    (user?.full_name && `Dr. ${user.full_name}`) ||
+    (user?.email && `Dr. ${user.email.split("@")[0]}`) ||
+    "Care Team";
+
   const patients = [
     {
       name: "Jacob",
@@ -28,7 +33,9 @@ const Dashboard = ({ onCaseClick }) => {
 
   return (
     <div>
-      <h1 className="text-3xl font-bold mb-8 text-gray-800">Welcome Dr. JD</h1>
+      <h1 className="mb-8 text-3xl font-bold text-gray-800">
+        Welcome {displayName}
+      </h1>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {patients.map((patient, idx) => (
           <PatientCard key={idx} patient={patient} onClick={onCaseClick} />

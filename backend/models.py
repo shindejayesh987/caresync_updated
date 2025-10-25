@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from typing import List, Literal, Optional
 from datetime import date
 
@@ -87,3 +87,29 @@ class PublishPayload(BaseModel):
     patient_id: str
     contacts: List[Contact]
     ot_id: Optional[str]      
+
+
+class UserBase(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = None
+
+
+class UserCreate(UserBase):
+    password: str = Field(min_length=8, max_length=72)
+
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=72)
+
+
+class UserResponse(UserBase):
+    id: str
+
+    model_config = {"from_attributes": True}
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    user: UserResponse
