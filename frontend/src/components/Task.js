@@ -153,7 +153,22 @@ const statusStyles = {
   },
 };
 
-const Task = ({ category, data, onEdit, onStaffEdit, onTaskEdit }) => {
+const priorityStyles = {
+  Critical: {
+    bg: "bg-red-100",
+    text: "text-red-700",
+  },
+  High: {
+    bg: "bg-amber-100",
+    text: "text-amber-700",
+  },
+  Routine: {
+    bg: "bg-slate-200",
+    text: "text-slate-600",
+  },
+};
+
+const Task = ({ category, data, onEdit, onTaskEdit }) => {
   const [selectedTask, setSelectedTask] = useState(null);
 
   return (
@@ -183,19 +198,26 @@ const Task = ({ category, data, onEdit, onStaffEdit, onTaskEdit }) => {
                 >
                   <button
                     type="button"
-                    onClick={() => onTaskEdit?.(staff, task)}
+                    onClick={() => onTaskEdit?.(staff, task, tIdx)}
                     className="text-xs text-emerald-600 hover:text-emerald-500"
                   >
                     Edit
                   </button>
-                  <div className="flex flex-1 flex-col gap-1">
+                  <div
+                    className="flex flex-1 flex-col gap-1 cursor-pointer"
+                    onClick={() => setSelectedTask(task)}
+                  >
                     <p className="text-sm text-gray-800">{task.label}</p>
                     <div className="flex flex-wrap gap-2 text-xs text-gray-500">
                       {task.time && <span>{task.time}</span>}
                       {task.note && <span className="text-gray-400">{task.note}</span>}
                       {task.priority && (
-                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
-                          Priority: {task.priority}
+                        <span
+                          className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                            (priorityStyles[task.priority] || priorityStyles.Routine).bg
+                          } ${(priorityStyles[task.priority] || priorityStyles.Routine).text}`}
+                        >
+                          {task.priority}
                         </span>
                       )}
                     </div>
@@ -224,6 +246,9 @@ const Task = ({ category, data, onEdit, onStaffEdit, onTaskEdit }) => {
             )}
             {selectedTask.note && (
               <p><strong>Note:</strong> {selectedTask.note}</p>
+            )}
+            {selectedTask.priority && (
+              <p><strong>Priority:</strong> {selectedTask.priority}</p>
             )}
             <div className="flex justify-end pt-2">
               <button

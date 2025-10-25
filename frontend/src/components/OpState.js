@@ -61,6 +61,25 @@ const publishPayloadTemplate = {
 
 const initialNurseNames = ["Susan", "Elizabeth"];
 const initialNurseTasks = buildNurseTaskMap(initialNurseNames);
+const initialSurgeryNurseTasks = {
+    Susan: [
+        { label: "Monitor vitals", status: "in_progress", time: "11:00", note: "HR stable", priority: "Routine" },
+        { label: "Manage IV fluids", status: "completed", time: "10:45", note: "Fluids replaced", priority: "Routine" },
+    ],
+};
+
+const initialSurgeryDoctorTasks = {
+    "Dr. Wong": [
+        { label: "Perform procedure", status: "pending", time: "12:00", note: "Scheduled after prep", priority: "High" },
+    ],
+};
+
+const initialPostOpNurseTasks = {
+    Elizabeth: [
+        { label: "Pain assessment", status: "pending", time: "14:00", note: "To follow-up", priority: "Routine" },
+        { label: "Discharge instructions", status: "in_progress", time: "15:00", note: "Started briefing", priority: "Routine" },
+    ],
+};
 const PRIORITY_OPTIONS = ["Routine", "High", "Critical"];
 
 const normalizeSuggestions = (data) => {
@@ -206,6 +225,9 @@ const OpState = ({ token }) => {
             { label: "Coordinate with anesthesia team", status: "pending", time: "09:00", note: "Waiting for update" },
         ],
     });
+    const [nurseTasksSurgery, setNurseTasksSurgery] = useState(initialSurgeryNurseTasks);
+    const [doctorTasksSurgery, setDoctorTasksSurgery] = useState(initialSurgeryDoctorTasks);
+    const [nurseTasksPostOp, setNurseTasksPostOp] = useState(initialPostOpNurseTasks);
     const [showTaskModal, setShowTaskModal] = useState(false);
     const [taskForm, setTaskForm] = useState({
         staff: "",
@@ -272,13 +294,62 @@ const OpState = ({ token }) => {
         return merged;
     }, [aiSuggestions, nurses]);
 
-    const hasSelectedResources = useMemo(
+const hasSelectedResources = useMemo(
         () =>
             Object.values(selectedCrewForSuggestion).some(
                 (ids) => Array.isArray(ids) && ids.length > 0
             ),
         [selectedCrewForSuggestion]
     );
+
+    const determineOwnerType = (staffName) => {
+        if (
+            availableNurseOptions.includes(staffName) ||
+            crewNurseDraft.includes(staffName) ||
+            Object.prototype.hasOwnProperty.call(nurseTasksSurgery, staffName) ||
+            Object.prototype.hasOwnProperty.call(nurseTasksPostOp, staffName)
+        ) {
+            return "nurse";
+        }
+        if (
+            doctorNameSuggestions.includes(staffName) ||
+            crewDoctorDraft.includes(staffName) ||
+            Object.prototype.hasOwnProperty.call(doctorTasksSurgery, staffName)
+        ) {
+            return "doctor";
+        }
+        return editingTaskContext?.type || "doctor";
+    };
+
+    const getTaskState = (scope, role) => {
+        if (scope === "surgery") {
+            if (role === "nurse") return [nurseTasksSurgery, setNurseTasksSurgery];
+            if (role === "doctor") return [doctorTasksSurgery, setDoctorTasksSurgery];
+        } else if (scope === "postop") {
+            if (role === "nurse") return [nurseTasksPostOp, setNurseTasksPostOp];
+        } else {
+            if (role === "nurse") return [nurseTasks, setNurseTasks];
+            if (role === "doctor") return [doctorTasksPreOp, setDoctorTasksPreOp];
+        }
+        return null;
+    };
+
+    const mutateTaskList = (scope, role, staffName, mutator) => {
+        const stateTuple = getTaskState(scope, role);
+        if (!stateTuple) return;
+        const [, setter] = stateTuple;
+        setter((prev) => {
+            const next = { ...prev };
+            const list = [...(next[staffName] || [])];
+            mutator(list);
+            if (list.length) {
+                next[staffName] = list;
+            } else {
+                delete next[staffName];
+            }
+            return next;
+        });
+    };
 
     const setSuggestions = (nextOrUpdater) => {
         setAiSuggestions((prev) => {
@@ -573,6 +644,7 @@ const OpState = ({ token }) => {
         setTaskFormError("");
         setUseCustomStaff(false);
         setCustomStaffName("");
+        setEditingTaskContext(null);
         setShowTaskModal(true);
     };
 
@@ -589,6 +661,7 @@ const OpState = ({ token }) => {
             note: "",
             priority: "Routine",
         });
+        setEditingTaskContext(null);
     };
 
     const handleTaskFieldChange = (field, value) => {
@@ -598,22 +671,7 @@ const OpState = ({ token }) => {
         }));
     };
 
-    const openTaskModalForStaff = (staffName, type) => {
-        setTaskForm({
-            staff: staffName,
-            label: "",
-            status: "pending",
-            time: "",
-            note: "",
-            priority: "Routine",
-        });
-        setUseCustomStaff(false);
-        setCustomStaffName("");
-        setTaskFormError("");
-        setShowTaskModal(true);
-    };
-
-    const openTaskEditModal = (staffName, task, type) => {
+    const openTaskEditModal = (staffName, task, type, index, scope) => {
         setTaskForm({
             staff: staffName,
             label: task.label || "",
@@ -625,6 +683,7 @@ const OpState = ({ token }) => {
         setUseCustomStaff(false);
         setCustomStaffName("");
         setTaskFormError("");
+        setEditingTaskContext({ type, staffName, index, scope });
         setShowTaskModal(true);
     };
 
@@ -654,60 +713,56 @@ const OpState = ({ token }) => {
             return;
         }
 
-        const newTask = {
-            label,
-            status,
-            priority,
-        };
-
+        const taskPayload = { label, status, priority };
         if (time) {
-            newTask.time = time;
+            taskPayload.time = time;
         }
         if (note) {
-            newTask.note = note;
+            taskPayload.note = note;
         }
 
-        const isNurse = nurses.includes(staff);
+        const baseScope = editingTaskContext?.scope || "preop";
+        let ownerType = determineOwnerType(staff);
+        if (!getTaskState(baseScope, ownerType)) {
+            ownerType = editingTaskContext?.type || ownerType;
+        }
 
-        if (isNurse) {
-            setNurseTasks((prev) => {
-                const updated = { ...prev };
-                const existing = updated[staff] ? cloneTasks(updated[staff]) : [];
-                updated[staff] = [...existing, newTask];
-                return updated;
-            });
+        if (editingTaskContext) {
+            const { type: oldType, staffName: oldStaff, index, scope: oldScope } = editingTaskContext;
+            if (
+                oldScope === baseScope &&
+                oldType === ownerType &&
+                oldStaff === staff
+            ) {
+                mutateTaskList(oldScope, ownerType, staff, (list) => {
+                    if (index >= 0 && index < list.length) {
+                        list[index] = taskPayload;
+                    } else {
+                        list.push(taskPayload);
+                    }
+                });
+            } else {
+                mutateTaskList(oldScope, oldType, oldStaff, (list) => {
+                    if (index >= 0 && index < list.length) {
+                        list.splice(index, 1);
+                    }
+                });
+                mutateTaskList(baseScope, ownerType, staff, (list) => {
+                    list.push(taskPayload);
+                });
+            }
         } else {
-            setDoctorTasksPreOp((prev) => {
-                const updated = { ...prev };
-                const existing = updated[staff] ? cloneTasks(updated[staff]) : [];
-                updated[staff] = [...existing, newTask];
-                return updated;
+            mutateTaskList("preop", ownerType, staff, (list) => {
+                list.push(taskPayload);
             });
         }
 
-        const assignmentOwner = `${isNurse ? "Nurse" : "Doctor"} ${staff}`;
+        const successMessage = editingTaskContext
+            ? "Task updated."
+            : `Task assigned to ${ownerType === "nurse" ? "Nurse" : "Doctor"} ${staff}.`;
+
         closeTaskModal();
-        showToast(`Task assigned to ${assignmentOwner}.`, "success");
-    };
-
-    const nurseTasksSurgery = {
-        Susan: [
-            { label: "Monitor vitals", status: "in_progress", time: "11:00", note: "HR stable" },
-            { label: "Manage IV fluids", status: "completed", time: "10:45", note: "Fluids replaced" },
-        ],
-    };
-
-    const doctorTasksSurgery = {
-        "Dr. Wong": [
-            { label: "Perform procedure", status: "pending", time: "12:00", note: "Scheduled after prep" },
-        ],
-    };
-
-    const nurseTasksPostOp = {
-        Elizabeth: [
-            { label: "Pain assessment", status: "pending", time: "14:00", note: "To follow-up" },
-            { label: "Discharge instructions", status: "in_progress", time: "15:00", note: "Started briefing" },
-        ],
+        showToast(successMessage, "success");
     };
 
     const renderTabs = () => (
@@ -956,13 +1011,12 @@ const OpState = ({ token }) => {
                     <Task
                         category="Nurses"
                         data={nurseTasks}
-                        onStaffEdit={(staffName) => openTaskModalForStaff(staffName, "nurse")}
-                        onTaskEdit={(staffName, task) => openTaskEditModal(staffName, task, "nurse")}
+                        onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "preop")}
                     />
                     <Task
                         category="Assistant Doctors"
                         data={doctorTasksPreOp}
-                        onTaskEdit={(staffName, task) => openTaskEditModal(staffName, task, "doctor")}
+                        onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "doctor", index, "preop")}
                     />
 
                     {/* ✅ Publish Button */}
@@ -1042,7 +1096,7 @@ const OpState = ({ token }) => {
                             />
                         </div>
 
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                             <div>
                                 <label className="block text-sm font-medium text-gray-700 mb-1">
                                     Status
@@ -1068,6 +1122,23 @@ const OpState = ({ token }) => {
                                     onChange={(e) => handleTaskFieldChange("time", e.target.value)}
                                     className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
                                 />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Priority
+                                </label>
+                                <select
+                                    value={taskForm.priority}
+                                    onChange={(e) => handleTaskFieldChange("priority", e.target.value)}
+                                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                                >
+                                    {PRIORITY_OPTIONS.map((option) => (
+                                        <option key={option} value={option}>
+                                            {option}
+                                        </option>
+                                    ))}
+                                </select>
                             </div>
                         </div>
 
@@ -1396,13 +1467,25 @@ const OpState = ({ token }) => {
                 </p>
                 {activeTab === "surgery" && (
                     <>
-                        <Task category="Nurses" data={nurseTasksSurgery} />
-                        <Task category="Doctors" data={doctorTasksSurgery} />
+                        <Task
+                            category="Nurses"
+                            data={nurseTasksSurgery}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "surgery")}
+                        />
+                        <Task
+                            category="Doctors"
+                            data={doctorTasksSurgery}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "doctor", index, "surgery")}
+                        />
                     </>
                 )}
                 {activeTab === "postop" && (
                     <>
-                        <Task category="Nurses" data={nurseTasksPostOp} />
+                        <Task
+                            category="Nurses"
+                            data={nurseTasksPostOp}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "postop")}
+                        />
                     </>
                 )}
             </>
