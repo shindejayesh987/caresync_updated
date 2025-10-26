@@ -1,6 +1,15 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import Task from "./Task";
-import { requestAvailability, publishPlan } from "../services/api";
+import {
+    requestAvailability,
+    publishPlan,
+    fetchTasks,
+    fetchCrew,
+    updateTasks,
+    updateCrew,
+} from "../services/api";
+import PublishSuccessEnhanced from "./PublishSuccessEnhanced";
 
 const defaultNurseTaskTemplates = [
   [
@@ -40,23 +49,6 @@ const defaultAvailabilityPayload = {
   required_operation_rooms: 1,
   required_equipment: "Anesthesia Machine",
   time_constraint_type: "exact",
-};
-
-const publishPayloadTemplate = {
-  patient_id: "123",
-  ot_id: "OT-21",
-  contacts: [
-    {
-      name: "Dr. Smith",
-      role: "surgeon",
-      email: "drsmith@example.com",
-    },
-    {
-      name: "Nurse Joy",
-      role: "nurse",
-      email: "nurse@example.com",
-    },
-  ],
 };
 
 const initialNurseNames = ["Susan", "Elizabeth"];
@@ -204,7 +196,15 @@ const deriveMatchStatus = (suggestions) => {
     };
 };
 
-const OpState = ({ token }) => {
+const OpState = ({
+    token,
+    patientId,
+    user,
+    timeline = [],
+    crewRoster = { doctors: [], nurses: [] },
+    vitalsSnapshot = {},
+    doctorId,
+}) => {
     const [activeTab, setActiveTab] = useState("preop");
     const [nurseTasks, setNurseTasks] = useState(initialNurseTasks);
     const [aiSuggestions, setAiSuggestions] = useState(null);
@@ -214,7 +214,9 @@ const OpState = ({ token }) => {
     const [selectedCrewForSuggestion, setSelectedCrewForSuggestion] = useState({});
     const [selectedPlanTasks, setSelectedPlanTasks] = useState({});
     const [loading, setLoading] = useState(false);
-    const [publishResponse, setPublishResponse] = useState(null);
+    const [publishing, setPublishing] = useState(false);
+    const [publishedPlan, setPublishedPlan] = useState(null);
+    const [publishedRecordId, setPublishedRecordId] = useState("");
     const [showPublishModal, setShowPublishModal] = useState(false);
     const [doctorTasksPreOp, setDoctorTasksPreOp] = useState({
         "Dr. Martinez": [
@@ -228,9 +230,15 @@ const OpState = ({ token }) => {
     const [nurseTasksSurgery, setNurseTasksSurgery] = useState(initialSurgeryNurseTasks);
     const [doctorTasksSurgery, setDoctorTasksSurgery] = useState(initialSurgeryDoctorTasks);
     const [nurseTasksPostOp, setNurseTasksPostOp] = useState(initialPostOpNurseTasks);
+    const [doctorTasksPostOp, setDoctorTasksPostOp] = useState({});
+    const [crewDoctors, setCrewDoctors] = useState([]);
+    const [crewNurses, setCrewNurses] = useState([]);
+    const [syncing, setSyncing] = useState(false);
+    const [syncError, setSyncError] = useState("");
     const [showTaskModal, setShowTaskModal] = useState(false);
     const [taskForm, setTaskForm] = useState({
         staff: "",
+        ownerType: "doctor",
         label: "",
         status: "pending",
         time: "",
@@ -247,8 +255,47 @@ const OpState = ({ token }) => {
     const [selectedNurseOption, setSelectedNurseOption] = useState("");
     const [crewError, setCrewError] = useState("");
     const [toast, setToast] = useState(null);
+    const [taskModalScope, setTaskModalScope] = useState("preop");
     const toastTimeoutRef = useRef(null);
     const [editingTaskContext, setEditingTaskContext] = useState(null);
+    const navigate = useNavigate();
+
+    const performerName = useMemo(() => {
+        if (user?.full_name) {
+            return user.full_name;
+        }
+        if (user?.email) {
+            return user.email;
+        }
+        return "CareSync Clinician";
+    }, [user]);
+
+    useEffect(() => {
+        if (crewRoster?.doctors?.length && crewDoctors.length === 0) {
+            const uniqueDoctors = Array.from(
+                new Set(
+                    crewRoster.doctors
+                        .map((name) => (name || "").trim())
+                        .filter(Boolean)
+                )
+            );
+            if (uniqueDoctors.length) {
+                setCrewDoctors(uniqueDoctors);
+            }
+        }
+        if (crewRoster?.nurses?.length && crewNurses.length === 0) {
+            const uniqueNurses = Array.from(
+                new Set(
+                    crewRoster.nurses
+                        .map((name) => (name || "").trim())
+                        .filter(Boolean)
+                )
+            );
+            if (uniqueNurses.length) {
+                setCrewNurses(uniqueNurses);
+            }
+            }
+        }, [crewRoster, crewDoctors.length, crewNurses.length]);
 
     useEffect(() => {
         return () => {
@@ -259,7 +306,7 @@ const OpState = ({ token }) => {
         };
     }, []);
 
-    const showToast = (message, type = "success") => {
+    const showToast = useCallback((message, type = "success") => {
         if (toastTimeoutRef.current) {
             clearTimeout(toastTimeoutRef.current);
         }
@@ -268,13 +315,108 @@ const OpState = ({ token }) => {
             setToast(null);
             toastTimeoutRef.current = null;
         }, 3000);
-    };
+    }, [setToast]);
+
+    const applyTaskSnapshot = useCallback((docs = []) => {
+        if (!Array.isArray(docs) || docs.length === 0) {
+            setDoctorTasksPreOp({});
+            setNurseTasks({});
+            setDoctorTasksSurgery({});
+            setNurseTasksSurgery({});
+            setDoctorTasksPostOp({});
+            setNurseTasksPostOp({});
+            return;
+        }
+
+        const bucket = {
+            preop: { doctor: {}, nurse: {} },
+            surgery: { doctor: {}, nurse: {} },
+            postop: { doctor: {}, nurse: {} },
+        };
+
+        docs.forEach((entry) => {
+            const scope = entry.scope;
+            const role = entry.staff_role === "nurse" ? "nurse" : "doctor";
+            const staffName = (entry.staff_name || "").trim();
+            if (!scope || !bucket[scope] || !staffName) {
+                return;
+            }
+            const cleanedTasks = (entry.tasks || [])
+                .filter((task) => task?.label)
+                .map((task) => ({
+                    label: task.label,
+                    status: task.status || "pending",
+                    note: task.note || "",
+                    time: task.time || "",
+                    priority: task.priority || "Routine",
+                }));
+
+            if (cleanedTasks.length === 0) {
+                return;
+            }
+
+            bucket[scope][role][staffName] = cleanedTasks;
+        });
+
+        setDoctorTasksPreOp(bucket.preop.doctor);
+        setNurseTasks(bucket.preop.nurse);
+        setDoctorTasksSurgery(bucket.surgery.doctor);
+        setNurseTasksSurgery(bucket.surgery.nurse);
+        setDoctorTasksPostOp(bucket.postop.doctor);
+        setNurseTasksPostOp(bucket.postop.nurse);
+    }, []);
+
+    const syncFromServer = useCallback(async () => {
+        if (!patientId || !token) {
+            return;
+        }
+        setSyncing(true);
+        setSyncError("");
+            try {
+            const [tasksResponse, crewResponse] = await Promise.all([
+                fetchTasks(patientId, token),
+                fetchCrew(patientId, token),
+            ]);
+
+            applyTaskSnapshot(tasksResponse?.tasks || []);
+            setCrewDoctors((crewResponse?.doctors || []).map((name) => name.trim()).filter(Boolean));
+            setCrewNurses((crewResponse?.nurses || []).map((name) => name.trim()).filter(Boolean));
+            } catch (err) {
+            console.error("Failed to sync surgical state", err);
+            setSyncError(err.message || "Unable to sync data from server.");
+            } finally {
+            setSyncing(false);
+            }
+        }, [patientId, token, applyTaskSnapshot]);
+
+    useEffect(() => {
+        syncFromServer();
+    }, [syncFromServer]);
 
     const doctorNameSuggestions = useMemo(
-        () => Object.keys(doctorTasksPreOp),
-        [doctorTasksPreOp]
+        () => Array.from(new Set([...(crewDoctors || []), ...Object.keys(doctorTasksPreOp || {})])),
+        [crewDoctors, doctorTasksPreOp]
     );
-    const nurses = useMemo(() => Object.keys(nurseTasks), [nurseTasks]);
+    const nurses = useMemo(
+        () => Array.from(new Set([...(crewNurses || []), ...Object.keys(nurseTasks || {})])),
+        [crewNurses, nurseTasks]
+    );
+    const surgeryDoctorNames = useMemo(
+        () => Object.keys(doctorTasksSurgery || {}),
+        [doctorTasksSurgery]
+    );
+    const surgeryNurseNames = useMemo(
+        () => Object.keys(nurseTasksSurgery || {}),
+        [nurseTasksSurgery]
+    );
+    const postOpNurseNames = useMemo(
+        () => Object.keys(nurseTasksPostOp || {}),
+        [nurseTasksPostOp]
+    );
+    const postOpDoctorNames = useMemo(
+        () => Object.keys(doctorTasksPostOp || {}),
+        [doctorTasksPostOp]
+    );
     const availableDoctorOptions = useMemo(() => {
         const aiNames = [
             ...(aiSuggestions?.assistantDoctors || []),
@@ -282,19 +424,31 @@ const OpState = ({ token }) => {
         ]
             .map((entry) => entry?.name?.trim())
             .filter(Boolean);
-        const merged = Array.from(new Set([...aiNames, ...doctorNameSuggestions]));
+        const existing = [
+            ...(crewDoctors || []),
+            ...doctorNameSuggestions,
+            ...surgeryDoctorNames,
+            ...postOpDoctorNames,
+        ];
+        const merged = Array.from(new Set([...aiNames, ...existing]));
         return merged;
-    }, [aiSuggestions, doctorNameSuggestions]);
+    }, [aiSuggestions, crewDoctors, doctorNameSuggestions, surgeryDoctorNames, postOpDoctorNames]);
 
     const availableNurseOptions = useMemo(() => {
         const aiNames = (aiSuggestions?.nurses || [])
             .map((entry) => entry?.name?.trim())
             .filter(Boolean);
-        const merged = Array.from(new Set([...aiNames, ...nurses]));
+        const existing = [
+            ...(crewNurses || []),
+            ...nurses,
+            ...surgeryNurseNames,
+            ...postOpNurseNames,
+        ];
+        const merged = Array.from(new Set([...aiNames, ...existing]));
         return merged;
-    }, [aiSuggestions, nurses]);
+    }, [aiSuggestions, crewNurses, nurses, surgeryNurseNames, postOpNurseNames]);
 
-const hasSelectedResources = useMemo(
+    const hasSelectedResources = useMemo(
         () =>
             Object.values(selectedCrewForSuggestion).some(
                 (ids) => Array.isArray(ids) && ids.length > 0
@@ -302,24 +456,75 @@ const hasSelectedResources = useMemo(
         [selectedCrewForSuggestion]
     );
 
-    const determineOwnerType = (staffName) => {
-        if (
-            availableNurseOptions.includes(staffName) ||
-            crewNurseDraft.includes(staffName) ||
-            Object.prototype.hasOwnProperty.call(nurseTasksSurgery, staffName) ||
-            Object.prototype.hasOwnProperty.call(nurseTasksPostOp, staffName)
-        ) {
-            return "nurse";
-        }
-        if (
-            doctorNameSuggestions.includes(staffName) ||
-            crewDoctorDraft.includes(staffName) ||
-            Object.prototype.hasOwnProperty.call(doctorTasksSurgery, staffName)
-        ) {
-            return "doctor";
-        }
-        return editingTaskContext?.type || "doctor";
-    };
+    const determineOwnerType = useCallback(
+        (staffName, scopeHint, fallbackType = "doctor") => {
+            if (scopeHint === "postop") {
+                if (
+                    postOpNurseNames.includes(staffName) ||
+                    availableNurseOptions.includes(staffName)
+                ) {
+                    return "nurse";
+                }
+                if (
+                    postOpDoctorNames.includes(staffName) ||
+                    availableDoctorOptions.includes(staffName)
+                ) {
+                    return "doctor";
+                }
+                return fallbackType || "nurse";
+            }
+            if (scopeHint === "surgery") {
+                if (
+                    surgeryNurseNames.includes(staffName) ||
+                    availableNurseOptions.includes(staffName)
+                ) {
+                    return "nurse";
+                }
+                if (
+                    surgeryDoctorNames.includes(staffName) ||
+                    availableDoctorOptions.includes(staffName)
+                ) {
+                    return "doctor";
+                }
+            }
+            if (
+                availableNurseOptions.includes(staffName) ||
+                crewNurseDraft.includes(staffName) ||
+                Object.prototype.hasOwnProperty.call(nurseTasksSurgery, staffName) ||
+                Object.prototype.hasOwnProperty.call(nurseTasksPostOp, staffName)
+            ) {
+                return "nurse";
+            }
+            if (
+                doctorNameSuggestions.includes(staffName) ||
+                crewDoctorDraft.includes(staffName) ||
+                Object.prototype.hasOwnProperty.call(doctorTasksSurgery, staffName)
+            ) {
+                return "doctor";
+            }
+            if (scopeHint === "surgery" && fallbackType) {
+                return fallbackType;
+            }
+            if (scopeHint === "postop") {
+                return "nurse";
+            }
+            return fallbackType || "doctor";
+        },
+        [
+            availableDoctorOptions,
+            availableNurseOptions,
+            crewDoctorDraft,
+            crewNurseDraft,
+            doctorNameSuggestions,
+            doctorTasksSurgery,
+            nurseTasksPostOp,
+            nurseTasksSurgery,
+            postOpDoctorNames,
+            postOpNurseNames,
+            surgeryDoctorNames,
+            surgeryNurseNames,
+        ]
+    );
 
     const getTaskState = (scope, role) => {
         if (scope === "surgery") {
@@ -327,6 +532,7 @@ const hasSelectedResources = useMemo(
             if (role === "doctor") return [doctorTasksSurgery, setDoctorTasksSurgery];
         } else if (scope === "postop") {
             if (role === "nurse") return [nurseTasksPostOp, setNurseTasksPostOp];
+            if (role === "doctor") return [doctorTasksPostOp, setDoctorTasksPostOp];
         } else {
             if (role === "nurse") return [nurseTasks, setNurseTasks];
             if (role === "doctor") return [doctorTasksPreOp, setDoctorTasksPreOp];
@@ -334,21 +540,59 @@ const hasSelectedResources = useMemo(
         return null;
     };
 
-    const mutateTaskList = (scope, role, staffName, mutator) => {
+    const persistTaskList = useCallback(
+        async (scope, role, staffName, tasksList) => {
+            if (!patientId || !token || !staffName) {
+                return;
+            }
+                try {
+                await updateTasks(
+                    {
+                        patient_id: patientId,
+                        scope,
+                        staff_name: staffName,
+                        staff_role: role,
+                        tasks: (tasksList || []).map((task) => ({
+                            label: task.label,
+                            status: task.status,
+                            note: task.note || undefined,
+                            time: task.time || undefined,
+                            priority: task.priority || undefined,
+                        })),
+                        performed_by: performerName,
+                    },
+                    token
+                );
+            } catch (err) {
+                console.error("Failed to persist task list", err);
+                showToast(err.message || "Unable to save task changes.", "error");
+                syncFromServer();
+            }
+        },
+        [patientId, performerName, showToast, syncFromServer, token]
+    );
+
+    const mutateTaskList = (scope, role, staffName, mutator, { persist = true } = {}) => {
         const stateTuple = getTaskState(scope, role);
         if (!stateTuple) return;
         const [, setter] = stateTuple;
+        let nextList = [];
         setter((prev) => {
             const next = { ...prev };
             const list = [...(next[staffName] || [])];
             mutator(list);
             if (list.length) {
                 next[staffName] = list;
+                nextList = list;
             } else {
                 delete next[staffName];
+                nextList = [];
             }
             return next;
         });
+        if (persist) {
+            persistTaskList(scope, role, staffName, nextList);
+        }
     };
 
     const setSuggestions = (nextOrUpdater) => {
@@ -362,7 +606,7 @@ const hasSelectedResources = useMemo(
     const handleFetchAISuggestions = async () => {
         setLoading(true);
         setAiError("");
-        try {
+            try {
             const data = await requestAvailability(defaultAvailabilityPayload, token);
             const normalized = normalizeSuggestions(data);
             setSuggestions(normalized);
@@ -425,32 +669,18 @@ const hasSelectedResources = useMemo(
         });
     };
 
-    const assignTaskToOwner = (ownerName, task, type) => {
+    const assignTaskToOwner = (scope, ownerName, task, typeHint) => {
         if (!ownerName) return;
-        if (type === "nurse") {
-            setNurseTasks((prev) => {
-                const updated = { ...prev };
-                if (!updated[ownerName]) {
-                    updated[ownerName] = [];
-                }
-                updated[ownerName] = [...updated[ownerName], task];
-                return updated;
-            });
-        } else {
-            setDoctorTasksPreOp((prev) => {
-                const updated = { ...prev };
-                if (!updated[ownerName]) {
-                    updated[ownerName] = [];
-                }
-                updated[ownerName] = [...updated[ownerName], task];
-                return updated;
-            });
-        }
+        const normalizedType = typeHint === "nurse" ? "nurse" : "doctor";
+        mutateTaskList(scope, normalizedType, ownerName, (list) => {
+            list.push(task);
+        });
     };
 
     const handleApplySelectedResources = () => {
         if (!aiSuggestions) return;
         let applied = 0;
+        const scope = activeTab || "preop";
 
         suggestionCategories.forEach(({ key, label, target }) => {
             const selectedIds = selectedCrewForSuggestion[key] || [];
@@ -470,7 +700,12 @@ const hasSelectedResources = useMemo(
                     note: target === "nurse" ? "Assigned via AI suggestion" : undefined,
                     priority: "Routine",
                 };
-                assignTaskToOwner(ownerName, task, target === "nurse" ? "nurse" : "doctor");
+                assignTaskToOwner(
+                    scope,
+                    ownerName,
+                    task,
+                    target === "nurse" ? "nurse" : "doctor"
+                );
                 applied += 1;
             });
         });
@@ -487,9 +722,81 @@ const hasSelectedResources = useMemo(
         setSelectedPlanTasks((prev) => ({ ...prev, [stepId]: assignee }));
     };
 
+    const crewList = useMemo(() => {
+        const doctorSource = crewDoctors.length
+            ? crewDoctors
+            : Array.isArray(crewRoster?.doctors)
+            ? crewRoster.doctors
+            : [];
+        const nurseSource = crewNurses.length
+            ? crewNurses
+            : Array.isArray(crewRoster?.nurses)
+            ? crewRoster.nurses
+            : [];
+
+        const entries = [];
+        const append = (role, name) => {
+            const trimmed = (name || "").trim();
+            if (!trimmed) return;
+            const key = `${role}-${trimmed.toLowerCase()}`;
+            if (entries.some((item) => item.key === key)) {
+                return;
+            }
+            const slug = trimmed
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, ".")
+                .replace(/^[.]+|[.]+$/g, "");
+            entries.push({
+                key,
+                role,
+                name: trimmed,
+                email: `${slug || role.toLowerCase()}@caresync.team`,
+            });
+        };
+
+        doctorSource.forEach((name) => append("Doctor", name));
+        nurseSource.forEach((name) => append("Nurse", name));
+
+        return entries.map(({ key, ...rest }) => rest);
+    }, [crewDoctors, crewNurses, crewRoster]);
+
+    const compileTasksPayload = useCallback(() => {
+        const groups = [];
+        const pushGroup = (scope, role, map) => {
+            Object.entries(map || {}).forEach(([staffName, taskList]) => {
+                if (!Array.isArray(taskList) || !taskList.length) {
+                    return;
+                }
+                groups.push({
+                    scope,
+                    owner_role: role,
+                    owner_name: staffName,
+                    tasks: taskList,
+                });
+            });
+        };
+
+        pushGroup("preop", "doctor", doctorTasksPreOp);
+        pushGroup("preop", "nurse", nurseTasks);
+        pushGroup("surgery", "doctor", doctorTasksSurgery);
+        pushGroup("surgery", "nurse", nurseTasksSurgery);
+        pushGroup("postop", "doctor", doctorTasksPostOp);
+        pushGroup("postop", "nurse", nurseTasksPostOp);
+
+        return groups;
+    }, [
+        doctorTasksPostOp,
+        doctorTasksPreOp,
+        doctorTasksSurgery,
+        nurseTasks,
+        nurseTasksPostOp,
+        nurseTasksSurgery,
+    ]);
+
     const handleApplyPlanSteps = () => {
         if (!aiPlan?.steps?.length) return;
         let applied = 0;
+        const scope = activeTab || "preop";
         aiPlan.steps.forEach((step) => {
             const assignee = selectedPlanTasks[step.id];
             if (!assignee) return;
@@ -499,8 +806,8 @@ const hasSelectedResources = useMemo(
                 note: step.detail,
                 priority: "High",
             };
-            const isNurse = Object.prototype.hasOwnProperty.call(nurseTasks, assignee);
-            assignTaskToOwner(assignee, task, isNurse ? "nurse" : "doctor");
+            const ownerType = determineOwnerType(assignee, scope, "doctor");
+            assignTaskToOwner(scope, assignee, task, ownerType);
             applied += 1;
         });
 
@@ -513,26 +820,125 @@ const hasSelectedResources = useMemo(
     };
 
 
-    const handlePublish = async () => {
-        try {
-            const data = await publishPlan(publishPayloadTemplate, token);
-            setPublishResponse(data);
-            setShowPublishModal(true);
-        } catch (err) {
-            console.error("❌ Publish failed:", err);
-            alert(err.message || "Failed to publish. Check console.");
+    const handlePublish = useCallback(
+        async (originTab) => {
+            const tabLabel = originTab || activeTab || "preop";
+            if (!crewList.length) {
+                showToast("Add at least one crew member before publishing.", "error");
+                return;
+            }
+
+            const planBusinessId =
+                typeof crypto !== "undefined" && crypto.randomUUID
+                    ? crypto.randomUUID()
+                    : `plan-${Date.now()}`;
+
+            const payload = {
+                plan_id: planBusinessId,
+                doctor_id: doctorId || user?.id || user?._id || "unknown-doctor",
+                timeline: Array.isArray(timeline) ? timeline : [],
+                crew: crewList,
+                tasks: compileTasksPayload(),
+                vitals: vitalsSnapshot || {},
+                timestamp: new Date().toISOString(),
+                tab: tabLabel,
+            };
+
+            setPublishing(true);
+            try {
+                const response = await publishPlan(payload, token);
+                const planData = response?.plan || payload;
+                setPublishedPlan(planData);
+                setPublishedRecordId(response?.plan_id || "");
+                setShowPublishModal(true);
+                showToast("Plan published to care team.", "success");
+            } catch (err) {
+                console.error("❌ Publish failed:", err);
+                showToast(err.message || "Failed to publish plan.", "error");
+            } finally {
+                setPublishing(false);
+            }
+        }, [
+            activeTab,
+            compileTasksPayload,
+            crewList,
+            doctorId,
+        showToast,
+        timeline,
+        token,
+        user,
+        vitalsSnapshot,
+    ]);
+
+    const handleClosePublishModal = useCallback(() => {
+        setShowPublishModal(false);
+        setPublishedPlan(null);
+        setPublishedRecordId("");
+    }, []);
+
+    const handleViewPublishedPlan = useCallback(() => {
+        if (!publishedRecordId) {
+            return;
         }
-    };
-    const assigneeOptions = useMemo(() => {
-        const combined = [...doctorNameSuggestions, ...nurses];
-        return Array.from(new Set(combined.filter(Boolean)));
-    }, [doctorNameSuggestions, nurses]);
+        navigate(`/plans/${publishedRecordId}`, { state: { plan: publishedPlan } });
+        handleClosePublishModal();
+    }, [navigate, publishedRecordId, publishedPlan, handleClosePublishModal]);
+    const preopAssigneeOptions = useMemo(
+        () => Array.from(new Set([...doctorNameSuggestions, ...nurses].filter(Boolean))),
+        [doctorNameSuggestions, nurses]
+    );
+    const surgeryAssigneeOptions = useMemo(
+        () => Array.from(new Set([...surgeryDoctorNames, ...surgeryNurseNames].filter(Boolean))),
+        [surgeryDoctorNames, surgeryNurseNames]
+    );
+    const postopAssigneeOptions = useMemo(
+        () => Array.from(new Set([...postOpDoctorNames, ...postOpNurseNames].filter(Boolean))),
+        [postOpDoctorNames, postOpNurseNames]
+    );
+    const globalAssigneeOptions = useMemo(
+        () =>
+            Array.from(
+                new Set([
+                    ...preopAssigneeOptions,
+                    ...surgeryAssigneeOptions,
+                    ...postopAssigneeOptions,
+                ])
+            ),
+        [postopAssigneeOptions, preopAssigneeOptions, surgeryAssigneeOptions]
+    );
+    const getAssigneeOptionsForScope = useCallback(
+        (scope) => {
+            if (scope === "surgery") {
+                return surgeryAssigneeOptions.length
+                    ? surgeryAssigneeOptions
+                    : preopAssigneeOptions;
+            }
+            if (scope === "postop") {
+                return postopAssigneeOptions.length
+                    ? postopAssigneeOptions
+                    : preopAssigneeOptions;
+            }
+            return preopAssigneeOptions;
+        },
+        [postopAssigneeOptions, preopAssigneeOptions, surgeryAssigneeOptions]
+    );
+    const currentModalScope = editingTaskContext?.scope || taskModalScope || activeTab || "preop";
+    const scopedAssigneeOptions = useMemo(() => {
+        const base = getAssigneeOptionsForScope(currentModalScope);
+        const seed = base.length ? base : globalAssigneeOptions;
+        if (editingTaskContext?.staffName && !seed.includes(editingTaskContext.staffName)) {
+            return [...seed, editingTaskContext.staffName];
+        }
+        return seed;
+    }, [currentModalScope, editingTaskContext, getAssigneeOptionsForScope, globalAssigneeOptions]);
 
     const openCrewModal = () => {
-        setCrewDoctorDraft([...doctorNameSuggestions]);
-        setCrewNurseDraft([...nurses]);
-        const doctorFallback = availableDoctorOptions.find((name) => !doctorNameSuggestions.includes(name)) || "";
-        const nurseFallback = availableNurseOptions.find((name) => !nurses.includes(name)) || "";
+        setCrewDoctorDraft([...(crewDoctors || [])]);
+        setCrewNurseDraft([...(crewNurses || [])]);
+        const doctorFallback =
+            availableDoctorOptions.find((name) => !(crewDoctors || []).includes(name)) || "";
+        const nurseFallback =
+            availableNurseOptions.find((name) => !(crewNurses || []).includes(name)) || "";
         setSelectedDoctorOption(doctorFallback);
         setSelectedNurseOption(nurseFallback);
         setCrewError("");
@@ -598,7 +1004,7 @@ const hasSelectedResources = useMemo(
         });
     };
 
-    const handleCrewSave = () => {
+    const handleCrewSave = async () => {
         const cleanedDoctors = crewDoctorDraft.map((name) => name.trim()).filter(Boolean);
         const cleanedNurses = crewNurseDraft.map((name) => name.trim()).filter(Boolean);
 
@@ -607,34 +1013,62 @@ const hasSelectedResources = useMemo(
             return;
         }
 
-        setDoctorTasksPreOp((prev) => {
-            const updated = {};
-            cleanedDoctors.forEach((name) => {
-                updated[name] = prev[name] ? cloneTasks(prev[name]) : [];
+            try {
+            if (patientId && token) {
+                await updateCrew(
+                    {
+                        patient_id: patientId,
+                        doctors: cleanedDoctors,
+                        nurses: cleanedNurses,
+                        performed_by: performerName,
+                    },
+                    token
+                );
+            }
+
+            setCrewDoctors(cleanedDoctors);
+            setCrewNurses(cleanedNurses);
+
+            setDoctorTasksPreOp((prev) => {
+                const updated = {};
+                cleanedDoctors.forEach((name) => {
+                    updated[name] = prev[name] ? cloneTasks(prev[name]) : [];
+                });
+                return updated;
             });
-            return updated;
-        });
 
-        setNurseTasks((prev) => buildNurseTaskMap(cleanedNurses, prev));
+            setNurseTasks((prev) => buildNurseTaskMap(cleanedNurses, prev));
 
-        setTaskForm((prev) => {
-            const combined = [...cleanedDoctors, ...cleanedNurses];
-            const fallback = combined[0] || "";
-            const nextStaff = combined.includes(prev.staff) ? prev.staff : fallback;
-            return {
-                ...prev,
-                staff: nextStaff,
-            };
-        });
+            setTaskForm((prev) => {
+                const combined = [...cleanedDoctors, ...cleanedNurses];
+                const fallback = combined[0] || "";
+                const nextStaff = combined.includes(prev.staff) ? prev.staff : fallback;
+                return {
+                    ...prev,
+                    staff: nextStaff,
+                };
+            });
 
-        closeCrewModal();
-        showToast("Team roster updated.", "success");
+            closeCrewModal();
+            showToast("Team roster updated.", "success");
+            setCrewError("");
+        } catch (err) {
+            console.error("Failed to update crew roster", err);
+            setCrewError(err.message || "Unable to update team roster. Please try again.");
+        }
     };
 
-    const openTaskModal = () => {
-        const defaultStaff = assigneeOptions[0] || "";
+    const openTaskModal = (scope) => {
+        const effectiveScope = scope || activeTab || "preop";
+        const scopeOptions = getAssigneeOptionsForScope(effectiveScope);
+        const availableOptions = scopeOptions.length ? scopeOptions : globalAssigneeOptions;
+        const defaultStaff = availableOptions[0] || "";
+        const defaultOwnerType = defaultStaff
+            ? determineOwnerType(defaultStaff, effectiveScope, "doctor")
+            : "doctor";
         setTaskForm({
             staff: defaultStaff,
+            ownerType: defaultOwnerType,
             label: "",
             status: "pending",
             time: "",
@@ -644,6 +1078,7 @@ const hasSelectedResources = useMemo(
         setTaskFormError("");
         setUseCustomStaff(false);
         setCustomStaffName("");
+        setTaskModalScope(effectiveScope);
         setEditingTaskContext(null);
         setShowTaskModal(true);
     };
@@ -654,7 +1089,8 @@ const hasSelectedResources = useMemo(
         setUseCustomStaff(false);
         setCustomStaffName("");
         setTaskForm({
-            staff: assigneeOptions[0] || "",
+            staff: preopAssigneeOptions[0] || globalAssigneeOptions[0] || "",
+            ownerType: "doctor",
             label: "",
             status: "pending",
             time: "",
@@ -665,15 +1101,20 @@ const hasSelectedResources = useMemo(
     };
 
     const handleTaskFieldChange = (field, value) => {
-        setTaskForm((prev) => ({
-            ...prev,
-            [field]: value,
-        }));
+        setTaskForm((prev) => {
+            const next = { ...prev, [field]: value };
+            if (field === "staff" && value && !useCustomStaff) {
+                const scopeForInference = editingTaskContext?.scope || taskModalScope || activeTab || "preop";
+                next.ownerType = determineOwnerType(value, scopeForInference, prev.ownerType);
+            }
+            return next;
+        });
     };
 
     const openTaskEditModal = (staffName, task, type, index, scope) => {
         setTaskForm({
             staff: staffName,
+            ownerType: type || "doctor",
             label: task.label || "",
             status: task.status || "pending",
             time: task.time || "",
@@ -684,6 +1125,7 @@ const hasSelectedResources = useMemo(
         setCustomStaffName("");
         setTaskFormError("");
         setEditingTaskContext({ type, staffName, index, scope });
+        setTaskModalScope(scope);
         setShowTaskModal(true);
     };
 
@@ -697,6 +1139,7 @@ const hasSelectedResources = useMemo(
         const time = taskForm.time;
         const note = taskForm.note.trim();
         const priority = taskForm.priority || "Routine";
+        const normalizedOwnerType = taskForm.ownerType === "nurse" ? "nurse" : taskForm.ownerType === "doctor" ? "doctor" : "";
 
         if (!staff) {
             setTaskFormError("Please specify who should own this task.");
@@ -713,6 +1156,11 @@ const hasSelectedResources = useMemo(
             return;
         }
 
+        if (!normalizedOwnerType) {
+            setTaskFormError("Please choose a valid role for this task.");
+            return;
+        }
+
         const taskPayload = { label, status, priority };
         if (time) {
             taskPayload.time = time;
@@ -721,8 +1169,11 @@ const hasSelectedResources = useMemo(
             taskPayload.note = note;
         }
 
-        const baseScope = editingTaskContext?.scope || "preop";
-        let ownerType = determineOwnerType(staff);
+        const baseScope = editingTaskContext?.scope || taskModalScope || activeTab || "preop";
+        let ownerType = normalizedOwnerType;
+        if (!getTaskState(baseScope, ownerType)) {
+            ownerType = determineOwnerType(staff, baseScope, normalizedOwnerType);
+        }
         if (!getTaskState(baseScope, ownerType)) {
             ownerType = editingTaskContext?.type || ownerType;
         }
@@ -752,7 +1203,7 @@ const hasSelectedResources = useMemo(
                 });
             }
         } else {
-            mutateTaskList("preop", ownerType, staff, (list) => {
+            mutateTaskList(baseScope, ownerType, staff, (list) => {
                 list.push(taskPayload);
             });
         }
@@ -765,280 +1216,427 @@ const hasSelectedResources = useMemo(
         showToast(successMessage, "success");
     };
 
-    const renderTabs = () => (
-        <div className="flex space-x-6 border-b mb-6">
-            {["preop", "surgery", "postop"].map((tab) => (
-                <button
-                    key={tab}
-                    onClick={() => setActiveTab(tab)}
-                    className={`pb-2 font-medium ${activeTab === tab
-                        ? "text-blue-600 border-b-2 border-blue-600"
-                        : "text-gray-500 hover:text-gray-700"
-                        }`}
-                >
-                    {tab.charAt(0).toUpperCase() + tab.slice(1)}
-                </button>
-            ))}
-        </div>
-    );
+    const renderTabs = () => {
+        const tabs = ["preop", "surgery", "postop"];
+        return (
+            <div className="flex w-full justify-center mb-8">
+                <div className="flex items-center justify-center gap-10">
+                    {tabs.map((tab) => {
+                        const isActive = activeTab === tab;
+                        return (
+                            <button
+                                key={tab}
+                                onClick={() => setActiveTab(tab)}
+                                className={`relative flex min-w-[5.5rem] flex-col items-center rounded-2xl px-5 py-2 text-sm font-semibold transition-all duration-200 ease-out backdrop-blur-md ${
+                                    isActive
+                                        ? "scale-105 border border-blue-400 bg-white/70 text-blue-700 shadow-lg shadow-blue-200/80"
+                                        : "border border-white/30 bg-white/30 text-slate-600 shadow-sm opacity-80 hover:opacity-100 hover:shadow-md hover:shadow-blue-100/60"
+                                }`}
+                            >
+                                <span className="uppercase tracking-wide text-xs">
+                                    {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                                </span>
+                                <span
+                                    className={`mt-1 h-[2px] w-3/4 rounded-full transition-all ${
+                                        isActive ? "bg-blue-500" : "bg-transparent"
+                                    }`}
+                                />
+                            </button>
+                        );
+                    })}
+                </div>
+            </div>
+        );
+    };
 
 
-    const renderPreOpLayout = () => (
 
-        <>
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                {/* AI Suggestions Panel */}
-                <div className="col-span-1 bg-gray-50 rounded-xl border border-gray-200 flex flex-col max-h-[calc(100vh-140px)]">
-                    <div className="overflow-y-auto px-4 pt-4 pb-2 space-y-4 text-sm text-gray-800">
-                        <h3 className="text-md font-semibold text-gray-800 mb-3">AI Suggestions</h3>
+    const renderAiPanel = () => (
+        <div className="col-span-1 bg-gray-50 rounded-xl border border-gray-200 flex flex-col max-h-[calc(100vh-140px)]">
+            <div className="overflow-y-auto px-4 pt-4 pb-2 space-y-4 text-sm text-gray-800">
+                <h3 className="text-md font-semibold text-gray-800 mb-3">AI Suggestions</h3>
 
-                        {loading && <p className="text-sm text-gray-500 mb-6">Loading...</p>}
+                {loading && <p className="text-sm text-gray-500 mb-6">Loading...</p>}
 
-                        {!aiPlan && !aiSuggestions && !loading && (
-                            <p className="text-sm text-gray-500 mb-6">Suggestions will appear here...</p>
-                        )}
+                {!aiPlan && !aiSuggestions && !loading && (
+                    <p className="text-sm text-gray-500 mb-6">Suggestions will appear here...</p>
+                )}
 
-                        {aiPlan && (
-                            <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-                                <div className="flex items-center justify-between">
-                                    <div>
-                                        <h4 className="text-sm font-semibold text-slate-900">AI Surgical Plan</h4>
-                                        <p className="text-xs text-slate-400">Urgency: {aiPlan.urgency}</p>
-                                    </div>
-                                    {aiPlan.tests?.length > 0 && (
-                                        <div className="flex flex-wrap gap-2">
-                                            {aiPlan.tests.map((test) => (
-                                                <span
-                                                    key={test}
-                                                    className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500"
-                                                >
-                                                    {test}
-                                                </span>
-                                            ))}
-                                        </div>
-                                    )}
-                                </div>
-                                <p className="mt-3 text-sm text-slate-600">{aiPlan.summary}</p>
-                                <div className="mt-4 space-y-3">
-                                    {aiPlan.steps.map((step) => (
-                                        <div key={step.id} className="flex flex-col gap-2 rounded-2xl border border-slate-100 bg-slate-50 px-3 py-3">
-                                            <div className="flex items-center justify-between gap-3">
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-900">{step.title}</p>
-                                                    <p className="text-xs text-slate-400">Suggested: {step.suggestedRole}</p>
-                                                </div>
-                                                <select
-                                                    value={selectedPlanTasks[step.id] || ""}
-                                                    onChange={(e) => handlePlanTaskSelection(step.id, e.target.value)}
-                                                    className="rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-200"
-                                                >
-                                                    <option value="">Assign</option>
-                                                    {assigneeOptions.map((option) => (
-                                                        <option key={option} value={option}>
-                                                            {option}
-                                                        </option>
-                                                    ))}
-                                                </select>
-                                            </div>
-                                            <p className="text-xs text-slate-500">{step.detail}</p>
-                                        </div>
+                {aiPlan && (
+                    <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <h4 className="text-sm font-semibold text-slate-900">AI Surgical Plan</h4>
+                                <p className="text-xs text-slate-400">Urgency: {aiPlan.urgency}</p>
+                            </div>
+                            {aiPlan.tests?.length > 0 && (
+                                <div className="flex flex-wrap gap-2">
+                                    {aiPlan.tests.map((test) => (
+                                        <span
+                                            key={test}
+                                            className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500"
+                                        >
+                                            {test}
+                                        </span>
                                     ))}
                                 </div>
-                                <div className="mt-4 flex justify-end">
-                                    <button
-                                        type="button"
-                                        onClick={handleApplyPlanSteps}
-                                        className="rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow hover:bg-emerald-500"
-                                    >
-                                        Add selected steps
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-
-                        {aiSuggestions && !aiError && (
-                            <div className="space-y-4">
-                                <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-                                    <div className="font-semibold text-xs uppercase tracking-wide text-slate-400">
-                                        Window
-                                    </div>
-                                    <div className="mt-2 text-sm text-slate-600">
-                                        <p>📅 {aiSuggestions.meta?.date}</p>
-                                        <p>⏰ {aiSuggestions.meta?.start} – {aiSuggestions.meta?.end}</p>
-                                    </div>
-                                </div>
-
-                                {suggestionCategories.map(({ key, label }) => {
-                                    const list = aiSuggestions[key] || [];
-                                    if (!list.length) return null;
-                                    const selectedIds = new Set(selectedCrewForSuggestion[key] || []);
-                                    return (
-                                        <div key={key} className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-                                            <div className="flex items-center justify-between">
-                                                <p className="text-xs uppercase tracking-wide text-slate-400">{label}</p>
-                                                {selectedIds.size > 0 && (
-                                                    <span className="text-xs text-emerald-600">{selectedIds.size} selected</span>
-                                                )}
-                                            </div>
-                                            <div className="mt-3 space-y-2">
-                                                {list.map((item) => (
-                                                    <div
-                                                        key={item.id}
-                                                        className="flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm text-slate-700"
-                                                    >
-                                                        <label className="flex flex-1 items-center gap-2">
-                                                            <input
-                                                                type="checkbox"
-                                                                checked={selectedIds.has(item.id)}
-                                                                onChange={() => toggleResourceSelection(key, item.id)}
-                                                                className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                                            />
-                                                            <div>
-                                                                <p className="font-medium text-slate-900">{item.name}</p>
-                                                                {item.email && (
-                                                                    <p className="text-xs text-slate-400">{item.email}</p>
-                                                                )}
-                                                            </div>
-                                                        </label>
-                                                        <div className="flex items-center gap-3 text-xs">
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => handleResourceEdit(key, item)}
-                                                                className="text-emerald-600 hover:text-emerald-500"
-                                                            >
-                                                                Edit
-                                                            </button>
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => handleResourceRemove(key, item.id)}
-                                                                className="text-red-500 hover:text-red-400"
-                                                            >
-                                                                Remove
-                                                            </button>
-                                                        </div>
-                                                    </div>
-                                                ))}
-                                            </div>
+                            )}
+                        </div>
+                        <p className="mt-3 text-sm text-slate-600">{aiPlan.summary}</p>
+                        <div className="mt-4 space-y-3">
+                            {aiPlan.steps.map((step) => (
+                                <div key={step.id} className="flex flex-col gap-2 rounded-2xl border border-slate-100 bg-slate-50 px-3 py-3">
+                                    <div className="flex items-center justify-between gap-3">
+                                        <div>
+                                            <p className="text-sm font-medium text-slate-900">{step.title}</p>
+                                            <p className="text-xs text-slate-400">Suggested: {step.suggestedRole}</p>
                                         </div>
-                                    );
-                                })}
-
-                                {aiSuggestions.tests?.length > 0 && (
-                                    <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-                                        <p className="text-xs uppercase tracking-wide text-slate-400">Latest MRI Tests</p>
-                                        <div className="mt-3 space-y-2 text-xs text-slate-500">
-                                            {aiSuggestions.tests.map((test, index) => (
-                                                <div key={index} className="flex justify-between">
-                                                    <span className="font-medium text-slate-700">{test.patient_id}</span>
-                                                    <span>{test.score}</span>
-                                                </div>
+                                        <select
+                                            value={selectedPlanTasks[step.id] || ""}
+                                            onChange={(e) => handlePlanTaskSelection(step.id, e.target.value)}
+                                            className="rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                                        >
+                                            <option value="">Assign</option>
+                                            {globalAssigneeOptions.map((option) => (
+                                                <option key={option} value={option}>
+                                                    {option}
+                                                </option>
                                             ))}
-                                        </div>
+                                        </select>
                                     </div>
-                                )}
-
-                                {matchStatus && (
-                                    <div
-                                        className={`rounded-3xl border px-4 py-3 text-center text-sm font-semibold shadow-sm ${
-                                            matchStatus.success === null
-                                                ? "border-slate-200 bg-slate-50 text-slate-500"
-                                                : matchStatus.success
-                                                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                                : "border-red-200 bg-red-50 text-red-600"
-                                        }`}
-                                    >
-                                        <p className="font-semibold">
-                                            {matchStatus.success === null
-                                                ? matchStatus.message
-                                                : `${matchStatus.success ? "✅" : "❌"} ${matchStatus.message}`}
-                                        </p>
-                                        {!matchStatus.success && matchStatus.missing?.length > 0 && (
-                                            <p className="mt-1 text-xs font-normal text-slate-500">
-                                                Needs: {matchStatus.missing.join(", ")}
-                                            </p>
-                                        )}
-                                    </div>
-                                )}
-                            </div>
-                        )}
-
-                        {aiError && (
-                            <p className="text-sm text-red-500">{aiError}</p>
-                        )}
-                    </div>
-
-                    {/* Buttons fixed at bottom */}
-                    <div className="flex justify-center gap-3 p-4 border-t bg-white">
-                        <button
-                            onClick={handleFetchAISuggestions}
-                            className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2 px-4 rounded-full shadow"
-                        >
-                            AI Suggestion
-                        </button>
-                        <button
-                            onClick={handleApplySelectedResources}
-                            disabled={!hasSelectedResources}
-                            className={`text-white text-sm font-medium py-2 px-4 rounded-full shadow transition ${hasSelectedResources ? "bg-blue-600 hover:bg-blue-700" : "bg-blue-300 cursor-not-allowed"}`}
-                        >
-                            Add to Task
-                        </button>
-                    </div>
-                </div>
-
-                {/* Tasks Panel */}
-                <div className="col-span-2">
-                    {renderTabs()}
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
-                        <p className="text-sm text-gray-600">Pre-Op Tasks</p>
-                        <div className="flex flex-wrap gap-2">
+                                    <p className="text-xs text-slate-500">{step.detail}</p>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="mt-4 flex justify-end">
                             <button
-                                onClick={openCrewModal}
-                                className="border border-gray-300 text-gray-700 px-5 py-2 rounded-full text-sm font-medium hover:bg-gray-50"
+                                type="button"
+                                onClick={handleApplyPlanSteps}
+                                className="rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow hover:bg-emerald-500"
                             >
-                                Edit Crew
-                            </button>
-                            <button
-                                onClick={openTaskModal}
-                                disabled={assigneeOptions.length === 0}
-                                className={`px-6 py-2 rounded-full text-sm font-semibold shadow transition ${assigneeOptions.length === 0
-                                    ? "bg-blue-300 text-white cursor-not-allowed"
-                                    : "bg-blue-600 text-white hover:bg-blue-700"}`}
-                            >
-                                + Generate Tasks
+                                Add selected steps
                             </button>
                         </div>
                     </div>
-                    <Task
-                        category="Nurses"
-                        data={nurseTasks}
-                        onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "preop")}
-                    />
-                    <Task
-                        category="Assistant Doctors"
-                        data={doctorTasksPreOp}
-                        onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "doctor", index, "preop")}
-                    />
+                )}
 
-                    {/* ✅ Publish Button */}
-                    <div className="mt-8 flex justify-end">
+                {aiSuggestions && !aiError && (
+                    <div className="space-y-4">
+                        <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                            <div className="font-semibold text-xs uppercase tracking-wide text-slate-400">
+                                Window
+                            </div>
+                            <div className="mt-2 text-sm text-slate-600">
+                                <p>📅 {aiSuggestions.meta?.date}</p>
+                                <p>⏰ {aiSuggestions.meta?.start} – {aiSuggestions.meta?.end}</p>
+                            </div>
+                        </div>
+
+                        {suggestionCategories.map(({ key, label }) => {
+                            const list = aiSuggestions[key] || [];
+                            if (!list.length) return null;
+                            const selectedIds = new Set(selectedCrewForSuggestion[key] || []);
+                            return (
+                                <div key={key} className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                    <div className="flex items-center justify-between">
+                                        <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                            {label}
+                                        </h4>
+                                        <span className="text-[10px] uppercase tracking-wider text-slate-300">
+                                            {list.length} option{list.length > 1 ? "s" : ""}
+                                        </span>
+                                    </div>
+                                    <div className="mt-3 space-y-2">
+                                        {list.map((item) => (
+                                            <div
+                                                key={item.id}
+                                                className={`flex items-start justify-between gap-3 rounded-2xl border px-3 py-2 transition ${
+                                                    selectedIds.has(item.id)
+                                                        ? "border-emerald-300 bg-emerald-50 shadow-sm"
+                                                        : "border-slate-200 hover:border-emerald-200 hover:bg-emerald-50 hover:bg-opacity-50"
+                                                }`}
+                                            >
+                                                <div>
+                                                    <p className="text-sm font-medium text-slate-900">{item.name}</p>
+                                                    {item.email && <p className="text-xs text-slate-400">{item.email}</p>}
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => toggleResourceSelection(key, item.id)}
+                                                        className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${
+                                                            selectedIds.has(item.id)
+                                                                ? "border-emerald-400 bg-emerald-500 text-white"
+                                                                : "border-slate-200 text-slate-500 hover:border-emerald-200 hover:text-emerald-600"
+                                                        }`}
+                                                    >
+                                                        {selectedIds.has(item.id) ? "Added" : "Add"}
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleResourceEdit(key, item)}
+                                                        className="text-slate-400 hover:text-emerald-500 text-xs"
+                                                    >
+                                                        Edit
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleResourceRemove(key, item.id)}
+                                                        className="text-red-500 hover:text-red-400"
+                                                    >
+                                                        Remove
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            );
+                        })}
+
+                        {aiSuggestions.tests?.length > 0 && (
+                            <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                <p className="text-xs uppercase tracking-wide text-slate-400">Latest MRI Tests</p>
+                                <div className="mt-3 space-y-2 text-xs text-slate-500">
+                                    {aiSuggestions.tests.map((test, index) => (
+                                        <div key={index} className="flex justify-between">
+                                            <span className="font-medium text-slate-700">{test.patient_id}</span>
+                                            <span>{test.score}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {matchStatus && (
+                            <div
+                                className={`rounded-3xl border px-4 py-3 text-center text-sm font-semibold shadow-sm ${
+                                    matchStatus.success === null
+                                        ? "border-slate-200 bg-slate-50 text-slate-500"
+                                        : matchStatus.success
+                                        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                        : "border-red-200 bg-red-50 text-red-600"
+                                }`}
+                            >
+                                <p className="font-semibold">
+                                    {matchStatus.success === null
+                                        ? matchStatus.message
+                                        : matchStatus.success
+                                        ? "Requirements matched"
+                                        : "Requirements not met"}
+                                </p>
+                                {!matchStatus.success && matchStatus.missing?.length > 0 && (
+                                    <p className="mt-1 text-xs font-normal text-slate-500">
+                                        Needs: {matchStatus.missing.join(", ")}
+                                    </p>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {aiError && (
+                    <p className="text-sm text-red-500">{aiError}</p>
+                )}
+            </div>
+
+            <div className="flex justify-center gap-3 p-4 border-t bg-white">
+                <button
+                    onClick={handleFetchAISuggestions}
+                    className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2 px-4 rounded-full shadow"
+                >
+                    AI Suggestion
+                </button>
+                <button
+                    onClick={handleApplySelectedResources}
+                    disabled={!hasSelectedResources}
+                    className={`text-white text-sm font-medium py-2 px-4 rounded-full shadow transition ${
+                        hasSelectedResources ? "bg-blue-600 hover:bg-blue-700" : "bg-blue-300 cursor-not-allowed"
+                    }`}
+                >
+                    Add to Task
+                </button>
+            </div>
+        </div>
+    );
+
+    const renderTasksColumn = () => {
+        const scope = activeTab || "preop";
+
+        const renderScopeActions = (scopeKey) => {
+            const label = scopeKey === "surgery" ? "Surgery Day Tasks" : "Post-Op Tasks";
+            return (
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
+                    <p className="text-sm text-gray-600">{label}</p>
+                    <div className="flex flex-wrap items-center gap-2">
                         <button
-                            onClick={handlePublish}
-                            className="bg-green-600 hover:bg-green-700 text-white text-sm font-semibold py-3 px-8 rounded-full shadow-md"
+                            onClick={openCrewModal}
+                            className="border border-gray-300 text-gray-700 px-5 py-2 rounded-full text-sm font-medium hover:bg-gray-50"
                         >
-                            Publish
+                            Edit Crew
                         </button>
+                        <button
+                            onClick={() => openTaskModal(scopeKey)}
+                            className="px-6 py-2 rounded-full text-sm font-semibold shadow transition bg-blue-600 text-white hover:bg-blue-700"
+                        >
+                            + Add Task
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
+        return (
+            <>
+                {renderTabs()}
+                {syncError && (
+                    <div className="mb-3 rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-600">
+                        {syncError}
+                    </div>
+                )}
+                {syncing && !syncError && (
+                    <div className="mb-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-2 text-xs text-slate-500">
+                        Syncing latest data&hellip;
+                    </div>
+                )}
+                {scope === "preop" ? (
+                    <>
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
+                            <p className="text-sm text-gray-600">Pre-Op Tasks</p>
+                            <div className="flex flex-wrap gap-2">
+                                <button
+                                    onClick={openCrewModal}
+                                    className="border border-gray-300 text-gray-700 px-5 py-2 rounded-full text-sm font-medium hover:bg-gray-50"
+                                >
+                                    Edit Crew
+                                </button>
+                                <button
+                                    onClick={openTaskModal}
+                                    disabled={preopAssigneeOptions.length === 0}
+                                    className={`px-6 py-2 rounded-full text-sm font-semibold shadow transition ${
+                                        preopAssigneeOptions.length === 0
+                                            ? "bg-blue-300 text-white cursor-not-allowed"
+                                            : "bg-blue-600 text-white hover:bg-blue-700"
+                                    }`}
+                                >
+                                    + Generate Tasks
+                                </button>
+                            </div>
+                        </div>
+                        <Task
+                            category="Nurses"
+                            data={nurseTasks}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "preop")}
+                        />
+                        <Task
+                            category="Assistant Doctors"
+                            data={doctorTasksPreOp}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "doctor", index, "preop")}
+                        />
+                        <div className="mt-8 flex justify-end">
+                            <button
+                                onClick={() => handlePublish("preop")}
+                                disabled={publishing}
+                                className={`rounded-full py-3 px-8 text-sm font-semibold text-white shadow-md transition ${
+                                    publishing
+                                        ? "bg-green-300 cursor-not-allowed"
+                                        : "bg-green-600 hover:bg-green-700"
+                                }`}
+                            >
+                                {publishing ? "Publishing…" : "Publish"}
+                            </button>
+                        </div>
+                    </>
+                ) : scope === "surgery" ? (
+                    <>
+                        {renderScopeActions("surgery")}
+                        <Task
+                            category="Nurses"
+                            data={nurseTasksSurgery}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "surgery")}
+                        />
+                        <Task
+                            category="Doctors"
+                            data={doctorTasksSurgery}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "doctor", index, "surgery")}
+                        />
+                        <div className="mt-8 flex justify-end">
+                            <button
+                                onClick={() => handlePublish("surgery")}
+                                disabled={publishing}
+                                className={`rounded-full py-3 px-8 text-sm font-semibold text-white shadow-md transition ${
+                                    publishing
+                                        ? "bg-green-300 cursor-not-allowed"
+                                        : "bg-green-600 hover:bg-green-700"
+                                }`}
+                            >
+                                {publishing ? "Publishing…" : "Publish"}
+                            </button>
+                        </div>
+                    </>
+                ) : (
+                    <>
+                        {renderScopeActions("postop")}
+                        <Task
+                            category="Nurses"
+                            data={nurseTasksPostOp}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "postop")}
+                        />
+                        <Task
+                            category="Doctors"
+                            data={doctorTasksPostOp}
+                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "doctor", index, "postop")}
+                        />
+                        <div className="mt-8 flex justify-end">
+                            <button
+                                onClick={() => handlePublish("postop")}
+                                disabled={publishing}
+                                className={`rounded-full py-3 px-8 text-sm font-semibold text-white shadow-md transition ${
+                                    publishing
+                                        ? "bg-green-300 cursor-not-allowed"
+                                        : "bg-green-600 hover:bg-green-700"
+                                }`}
+                            >
+                                {publishing ? "Publishing…" : "Publish"}
+                            </button>
+                        </div>
+                    </>
+                )}
+            </>
+        );
+    };
+
+    return (
+        <> 
+            {toast && (
+                <div className="fixed top-6 right-6 z-50">
+                    <div
+                        className={`rounded-lg px-4 py-3 text-sm font-semibold text-white shadow-lg ${
+                            toast.type === "success" ? "bg-green-600" : "bg-red-600"
+                        }`}
+                    >
+                        {toast.message}
+                    </div>
+                </div>
+            )}
+            <div className="mt-10">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {renderAiPanel()}
+                    <div className="col-span-2">
+                        {renderTasksColumn()}
                     </div>
                 </div>
             </div>
 
-            {/* Doctor Task Modal */}
             {showTaskModal && (
                 <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 px-4">
                     <form
                         onSubmit={handleTaskSubmit}
                         className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl space-y-4"
                     >
-                        <h2 className="text-lg font-semibold text-gray-800">Generate Doctor Task</h2>
+                        <h2 className="text-lg font-semibold text-gray-800">
+                            {editingTaskContext ? "Edit Task" : "Add Task"}
+                        </h2>
 
                         <p className="text-sm text-gray-500">
                             Capture a new action item for the surgical team. You can pick an existing doctor or assign a new one.
@@ -1062,10 +1660,10 @@ const hasSelectedResources = useMemo(
                                     }}
                                     className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
                                 >
-                                    {assigneeOptions.length === 0 && (
+                                    {scopedAssigneeOptions.length === 0 && (
                                         <option value="">Select team member</option>
                                     )}
-                                    {assigneeOptions.map((name) => (
+                                    {scopedAssigneeOptions.map((name) => (
                                         <option key={name} value={name}>
                                             {name}
                                         </option>
@@ -1082,6 +1680,19 @@ const hasSelectedResources = useMemo(
                                     />
                                 )}
                             </div>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                Role
+                            </label>
+                            <select
+                                value={taskForm.ownerType}
+                                onChange={(e) => handleTaskFieldChange("ownerType", e.target.value)}
+                                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                            >
+                                <option value="doctor">Doctor</option>
+                                <option value="nurse">Nurse</option>
+                            </select>
                         </div>
 
                         <div>
@@ -1179,64 +1790,21 @@ const hasSelectedResources = useMemo(
                 </div>
             )}
 
-            {/* ✅ Publish Modal */}
-            {showPublishModal && publishResponse && (
-                <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
-                    <div className="bg-white w-[90%] max-w-md rounded-xl shadow-lg p-6 space-y-4">
-                        <h2 className="text-lg font-semibold text-gray-800">✅ Published Successfully</h2>
-
-                        <div className="text-sm text-gray-700 space-y-2">
-                            <p><strong>Status:</strong> {publishResponse.status}</p>
-                            <p><strong>Patient ID:</strong> {publishResponse.patient_id}</p>
-
-                            <div>
-                                <strong className="block mb-1">Confirmations:</strong>
-                                <div className="space-y-2">
-                                    {Array.isArray(publishResponse.confirmations) &&
-                                        publishResponse.confirmations.map((msg, i) => (
-                                            <div
-                                                key={i}
-                                                className="flex items-start gap-2 bg-gray-50 px-3 py-2 rounded-md border border-gray-200 text-sm text-gray-700"
-                                            >
-                                                <span className="text-blue-500 mt-0.5">✉️</span>
-                                                <span>{msg}</span>
-                                            </div>
-                                        ))}
-                                </div>
-                            </div>
-
-
-                            <div className="flex flex-col gap-2">
-                                <div className="flex items-center gap-2">
-                                    <strong className="text-sm">OT Booked:</strong>
-                                    <span className={publishResponse.ot_booked ? "text-green-600 font-medium" : "text-red-600"}>
-                                        {publishResponse.ot_booked ? "Yes" : "No"}
-                                    </span>
-                                </div>
-
-                                {publishResponse.ot_id && (
-                                    <div className="flex items-center gap-2">
-                                        <strong className="text-sm">OT ID:</strong>
-                                        <span className="text-gray-800">{publishResponse.ot_id}</span>
-                                    </div>
-                                )}
-                            </div>
-
-                        </div>
-
-                        <div className="flex justify-end">
-                            <button
-                                onClick={() => setShowPublishModal(false)}
-                                className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700"
-                            >
-                                Close
-                            </button>
-                        </div>
-                    </div>
-                </div>
+            {showPublishModal && (
+                <PublishSuccessEnhanced
+                    plan={publishedPlan}
+                    planRecordId={publishedRecordId}
+                    recipients={
+                        Array.isArray(publishedPlan?.crew) && publishedPlan.crew.length
+                            ? publishedPlan.crew
+                            : crewList
+                    }
+                    doctorName={performerName}
+                    onClose={handleClosePublishModal}
+                    onViewPlan={handleViewPublishedPlan}
+                />
             )}
 
-            {/* Crew Management Modal */}
             {showCrewModal && (
                 <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50 px-4">
                     <div className="w-full max-w-3xl rounded-2xl bg-white p-6 shadow-xl space-y-6">
@@ -1383,129 +1951,6 @@ const hasSelectedResources = useMemo(
                     </div>
                 </div>
             )}
-        </>
-    );
-
-    //                     </div>
-    //                     <div className="space-y-1">
-    //                       {(list.length > 0 ? list : [{ id: "", name: "No entries", email: "" }]).map((item, i) => (
-    //                         <div key={i} className="flex items-center justify-between p-2 bg-gray-50 rounded-md border text-sm text-gray-700">
-    //                           <div className="flex items-center gap-2">
-    //                             <input type="checkbox" className="form-checkbox h-4 w-4 text-blue-600" />
-    //                             <div>
-    //                               <div className="font-medium">{item.name}</div>
-    //                               {item.email && (
-    //                                 <div className="text-xs text-gray-500">{item.email}</div>
-    //                               )}
-    //                             </div>
-    //                           </div>
-    //                           <span className="text-gray-400 cursor-pointer hover:text-gray-600 text-xs">✏️</span>
-    //                         </div>
-    //                       ))}
-    //                     </div>
-    //                   </div>
-    //                 ))}
-
-    //                 {/* MRI Test Scores */}
-    //                 <div className="bg-white rounded-lg border shadow-sm p-4">
-    //                   <div className="font-semibold text-xs text-gray-500 uppercase mb-2">
-    //                     Latest MRI Test Scores
-    //                   </div>
-    //                   <div className="space-y-1 text-gray-700 text-sm">
-    //                     {aiData.latest_test_scores.length === 0 ? (
-    //                       <p className="text-xs text-gray-400">No scores available.</p>
-    //                     ) : (
-    //                       aiData.latest_test_scores.map((s, i) => (
-    //                         <div key={i} className="flex justify-between">
-    //                           <span className="font-medium">{s.patient_id}</span>
-    //                           <span>{s.score}</span>
-    //                         </div>
-    //                       ))
-    //                     )}
-    //                   </div>
-    //                 </div>
-
-    //                 {/* Match Status */}
-    //                 <div className="text-center bg-green-50 text-green-700 font-semibold text-sm px-3 py-2 rounded-md border border-green-200 shadow-sm">
-    //                   ✅ {aiData.match_status}
-    //                 </div>
-    //               </div>
-    //             )}
-
-    //             {aiData?.error && (
-    //               <p className="text-sm text-red-500">{aiData.error}</p>
-    //             )}
-    //           </div>
-
-    //           {/* Buttons fixed at bottom */}
-    //           <div className="flex justify-center gap-3 p-4 border-t bg-white">
-    //             <button
-    //               onClick={handleFetchAISuggestions}
-    //               className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2 px-4 rounded-full shadow"
-    //             >
-    //               AI Suggestion
-    //             </button>
-    //             <button className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium py-2 px-4 rounded-full shadow">
-    //               Add to Task
-    //             </button>
-    //           </div>
-    //         </div>
-    //       </div>
-    //     </>
-    //   );
-
-
-
-    const renderTabContent = () => {
-        if (activeTab === "preop") return renderPreOpLayout();
-
-        return (
-            <>
-                {renderTabs()}
-                <p className="text-sm text-gray-600 mb-4">
-                    {activeTab === "surgery" ? "Surgery Day Tasks" : "Post-Op Tasks"}
-                </p>
-                {activeTab === "surgery" && (
-                    <>
-                        <Task
-                            category="Nurses"
-                            data={nurseTasksSurgery}
-                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "surgery")}
-                        />
-                        <Task
-                            category="Doctors"
-                            data={doctorTasksSurgery}
-                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "doctor", index, "surgery")}
-                        />
-                    </>
-                )}
-                {activeTab === "postop" && (
-                    <>
-                        <Task
-                            category="Nurses"
-                            data={nurseTasksPostOp}
-                            onTaskEdit={(staffName, task, index) => openTaskEditModal(staffName, task, "nurse", index, "postop")}
-                        />
-                    </>
-                )}
-            </>
-        );
-    };
-
-    return (
-        <>
-            {toast && (
-                <div className="fixed top-6 right-6 z-50">
-                    <div
-                        className={`rounded-lg px-4 py-3 text-sm font-semibold text-white shadow-lg ${
-                            toast.type === "success" ? "bg-green-600" : "bg-red-600"
-                        }`}
-                    >
-                        {toast.message}
-                    </div>
-                </div>
-            )}
-            <div className="mt-10">{renderTabContent()}</div>
         </>
     );
 

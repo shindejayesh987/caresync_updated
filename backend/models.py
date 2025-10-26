@@ -1,6 +1,7 @@
-from pydantic import BaseModel, EmailStr, Field
-from typing import List, Literal, Optional
-from datetime import date
+from datetime import date, datetime
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 class TimeWindow(BaseModel):
     day_of_week: int
@@ -84,10 +85,14 @@ class Contact(BaseModel):
     email: str
 
 class PublishPayload(BaseModel):
-    patient_id: str
-    contacts: List[Contact]
-    ot_id: Optional[str]      
-
+    plan_id: str
+    doctor_id: str
+    timeline: List[Dict[str, Any]]
+    crew: List[Dict[str, Any]]
+    tasks: List[Dict[str, Any]]
+    vitals: Dict[str, Any]
+    timestamp: datetime
+    tab: Optional[str] = None
 
 class UserBase(BaseModel):
     email: EmailStr
@@ -113,3 +118,87 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     user: UserResponse
+
+
+class LogoutPayload(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[EmailStr] = None
+
+    @model_validator(mode="after")
+    def validate_identifier(self):
+        if not (self.user_id or self.email):
+            raise ValueError("Either user_id or email must be provided")
+        return self
+
+
+class ChangePasswordPayload(BaseModel):
+    email: EmailStr
+    old_password: str = Field(min_length=8, max_length=72)
+    new_password: str = Field(min_length=8, max_length=72)
+
+
+class TaskEntry(BaseModel):
+    label: str
+    status: Literal["pending", "in_progress", "completed"]
+    note: Optional[str] = None
+    time: Optional[str] = None
+    priority: Optional[str] = None
+
+
+class TaskUpdatePayload(BaseModel):
+    patient_id: str
+    scope: Literal["preop", "surgery", "postop"]
+    staff_name: str
+    staff_role: Literal["doctor", "nurse"]
+    tasks: List[TaskEntry]
+    performed_by: Optional[str] = None
+
+
+class CrewUpdatePayload(BaseModel):
+    patient_id: str
+    doctors: List[str]
+    nurses: List[str]
+    performed_by: Optional[str] = None
+
+
+class TimelineStep(BaseModel):
+    id: str
+    title: str
+    time: str
+    owner: str
+    status: Literal["done", "active", "upcoming"]
+
+
+class TimelineUpdatePayload(BaseModel):
+    patient_id: str
+    steps: List[TimelineStep]
+    performed_by: Optional[str] = None
+
+
+class VitalsPayload(BaseModel):
+    patient_id: str
+    heart_rate: str
+    blood_pressure: str
+    spo2: str
+    captured_at: Optional[datetime] = None
+    performed_by: Optional[str] = None
+
+
+class SurgeryUpdatePayload(BaseModel):
+    patient_name: Optional[str] = None
+    procedure: Optional[str] = None
+    date: Optional[str] = None
+    status: Optional[str] = None
+    doctor_id: Optional[str] = None
+    performed_by: Optional[str] = None
+
+    @model_validator(mode="after")
+    def ensure_update_fields(self):
+        update_fields = {
+            key: value
+            for key, value in self.model_dump(exclude={"performed_by"}).items()
+            if value is not None
+        }
+        if not update_fields:
+            raise ValueError("At least one updatable field must be provided")
+        return self

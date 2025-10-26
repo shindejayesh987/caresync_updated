@@ -155,15 +155,18 @@
 
 # ===== main.py =====
 import os
-from fastapi import FastAPI, HTTPException, status, Request
-from motor.motor_asyncio import AsyncIOMotorClient
-from datetime import datetime, date, timedelta
 import asyncio
-from typing import List, Union, Optional
+import os
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Optional, Union
+
+from bson import ObjectId
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware  # ✅ Already present
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 
 try:
     import email_validator  # noqa: F401
@@ -198,6 +201,13 @@ from models import (
     UserResponse,
     UserLogin,
     TokenResponse,
+    LogoutPayload,
+    ChangePasswordPayload,
+    TaskUpdatePayload,
+    CrewUpdatePayload,
+    TimelineUpdatePayload,
+    VitalsPayload,
+    SurgeryUpdatePayload,
 )
 
 # Load variables from a local .env file if present
@@ -214,6 +224,61 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 client = AsyncIOMotorClient(MONGODB_URL)
 db = client[MONGODB_DB_NAME]
+
+
+def current_timestamp() -> datetime:
+    return datetime.utcnow()
+
+
+def to_object_id(value: str) -> ObjectId:
+    try:
+        return ObjectId(value)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid identifier: {value}") from exc
+
+
+async def log_auth_event(user_id: Optional[str], email: Optional[str], event: str, metadata: Optional[Dict] = None) -> None:
+    doc = {
+        "user_id": user_id,
+        "email": email,
+        "event": event,
+        "metadata": metadata or {},
+        "timestamp": current_timestamp(),
+    }
+    await db.auth_logs.insert_one(doc)
+
+
+async def log_activity(action: str, performed_by: Optional[str], payload: Dict) -> None:
+    doc = {
+        "action": action,
+        "performed_by": performed_by,
+        "payload": payload,
+        "timestamp": current_timestamp(),
+    }
+    await db.activity_logs.insert_one(doc)
+
+
+def serialize_doc(doc: dict) -> dict:
+    if not doc:
+        return doc
+    serialized = {**doc}
+    oid = serialized.get("_id")
+    if isinstance(oid, ObjectId):
+        serialized["_id"] = str(oid)
+
+    for key in [
+        "created_at",
+        "updated_at",
+        "last_login",
+        "captured_at",
+        "recorded_at",
+        "timestamp",
+    ]:
+        value = serialized.get(key)
+        if isinstance(value, datetime):
+            serialized[key] = value.isoformat()
+
+    return serialized
 
 
 def get_password_hash(password: str) -> str:
@@ -378,11 +443,15 @@ async def signup_user(payload: UserCreate) -> UserResponse:
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
+    now = current_timestamp()
     user_doc = {
         "email": email,
         "full_name": payload.full_name,
         "hashed_password": hashed_password,
-        "created_at": datetime.utcnow(),
+        "created_at": now,
+        "updated_at": now,
+        "last_login": None,
+        "session_token": None,
     }
 
     try:
@@ -391,6 +460,7 @@ async def signup_user(payload: UserCreate) -> UserResponse:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
 
     user_doc["_id"] = result.inserted_id
+    await log_auth_event(str(result.inserted_id), email, "signup", {"full_name": payload.full_name})
     return user_doc_to_response(user_doc)
 
 
@@ -402,8 +472,66 @@ async def login_user(payload: UserLogin) -> TokenResponse:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     token = create_access_token(str(user_doc["_id"]))
+    now = current_timestamp()
+    await db.users.update_one(
+        {"_id": user_doc["_id"]},
+        {
+            "$set": {
+                "last_login": now,
+                "session_token": token,
+                "updated_at": now,
+            }
+        },
+    )
+    await log_auth_event(str(user_doc["_id"]), email, "login", {"token": token})
     user = user_doc_to_response(user_doc)
     return TokenResponse(access_token=token, user=user)
+
+
+@app.post("/auth/logout")
+async def logout_user(payload: LogoutPayload) -> Dict[str, str]:
+    query: Dict[str, Union[str, ObjectId]] = {}
+    if payload.user_id:
+        query["_id"] = to_object_id(payload.user_id)
+    if payload.email:
+        query["email"] = payload.email.lower()
+
+    user_doc = await db.users.find_one(query)
+    if not user_doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    await db.users.update_one(
+        {"_id": user_doc["_id"]},
+        {"$set": {"session_token": None, "updated_at": current_timestamp()}},
+    )
+    await log_auth_event(str(user_doc["_id"]), user_doc["email"], "logout", {})
+    return {"detail": "Logged out"}
+
+
+@app.post("/auth/change-password")
+async def change_password(payload: ChangePasswordPayload) -> Dict[str, str]:
+    email = payload.email.lower()
+    user_doc = await get_user_by_email(email)
+    if not user_doc or not verify_password(payload.old_password, user_doc.get("hashed_password", "")):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+    try:
+        new_hash = get_password_hash(payload.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    now = current_timestamp()
+    await db.users.update_one(
+        {"_id": user_doc["_id"]},
+        {
+            "$set": {
+                "hashed_password": new_hash,
+                "updated_at": now,
+            }
+        },
+    )
+    await log_auth_event(str(user_doc["_id"]), email, "password_change", {})
+    return {"detail": "Password updated"}
 
 
 @app.post(
@@ -465,22 +593,229 @@ async def check_availability(req: AvailabilityRequest):
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 
+@app.post("/tasks/update")
+async def update_tasks(payload: TaskUpdatePayload) -> Dict[str, str]:
+    now = current_timestamp()
+    filter_doc = {
+        "patient_id": payload.patient_id,
+        "scope": payload.scope,
+        "staff_name": payload.staff_name,
+        "staff_role": payload.staff_role,
+    }
+    task_docs = [task.model_dump(exclude_none=True) for task in payload.tasks]
+    await db.tasks.update_one(
+        filter_doc,
+        {
+            "$set": {
+                "patient_id": payload.patient_id,
+                "scope": payload.scope,
+                "staff_name": payload.staff_name,
+                "staff_role": payload.staff_role,
+                "tasks": task_docs,
+                "updated_at": now,
+                "performed_by": payload.performed_by,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    await log_activity(
+        "tasks.update",
+        payload.performed_by,
+        {**filter_doc, "task_count": len(task_docs)},
+    )
+    return {"detail": "Tasks updated"}
+
+
+@app.post("/crew/update")
+async def update_crew(payload: CrewUpdatePayload) -> Dict[str, str]:
+    now = current_timestamp()
+    await db.crew_assignments.update_one(
+        {"patient_id": payload.patient_id},
+        {
+            "$set": {
+                "doctors": payload.doctors,
+                "nurses": payload.nurses,
+                "updated_at": now,
+                "performed_by": payload.performed_by,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    await log_activity(
+        "crew.update",
+        payload.performed_by,
+        {"patient_id": payload.patient_id, "doctor_count": len(payload.doctors), "nurse_count": len(payload.nurses)},
+    )
+    return {"detail": "Crew updated"}
+
+
+@app.post("/timeline/update")
+async def update_timeline(payload: TimelineUpdatePayload) -> Dict[str, str]:
+    now = current_timestamp()
+    steps_doc = [step.model_dump() for step in payload.steps]
+    await db.timeline.update_one(
+        {"patient_id": payload.patient_id},
+        {
+            "$set": {
+                "steps": steps_doc,
+                "updated_at": now,
+                "performed_by": payload.performed_by,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    await log_activity(
+        "timeline.update",
+        payload.performed_by,
+        {"patient_id": payload.patient_id, "step_count": len(steps_doc)},
+    )
+    return {"detail": "Timeline updated"}
+
+
+@app.post("/vitals/update")
+async def record_vitals(payload: VitalsPayload) -> Dict[str, str]:
+    now = payload.captured_at or current_timestamp()
+    vitals_doc = {
+        "patient_id": payload.patient_id,
+        "heart_rate": payload.heart_rate,
+        "blood_pressure": payload.blood_pressure,
+        "spo2": payload.spo2,
+        "captured_at": now,
+        "recorded_at": current_timestamp(),
+        "recorded_by": payload.performed_by,
+    }
+    await db.vitals.insert_one(vitals_doc)
+    await log_activity(
+        "vitals.record",
+        payload.performed_by,
+        {"patient_id": payload.patient_id, "captured_at": now},
+    )
+    return {"detail": "Vitals recorded"}
+
+
+@app.get("/tasks/{patient_id}")
+async def fetch_tasks(patient_id: str) -> Dict[str, List[dict]]:
+    cursor = db.tasks.find({"patient_id": patient_id})
+    items: List[dict] = []
+    async for doc in cursor:
+        items.append(serialize_doc(doc))
+    return {"tasks": items}
+
+
+@app.get("/crew/{patient_id}")
+async def fetch_crew(patient_id: str) -> dict:
+    doc = await db.crew_assignments.find_one({"patient_id": patient_id})
+    return serialize_doc(doc) if doc else {"patient_id": patient_id, "doctors": [], "nurses": []}
+
+
+@app.get("/timeline/{patient_id}")
+async def fetch_timeline(patient_id: str) -> dict:
+    doc = await db.timeline.find_one({"patient_id": patient_id})
+    return serialize_doc(doc) if doc else {"patient_id": patient_id, "steps": []}
+
+
+@app.get("/vitals/{patient_id}/latest")
+async def fetch_latest_vitals(patient_id: str) -> dict:
+    doc = await db.vitals.find({"patient_id": patient_id}).sort("captured_at", -1).limit(1).to_list(length=1)
+    if not doc:
+        return {"patient_id": patient_id, "heart_rate": None, "blood_pressure": None, "spo2": None}
+    return serialize_doc(doc[0])
+
+
+@app.get("/surgeries/{doctor_id}")
+async def fetch_surgeries_for_doctor(doctor_id: str) -> Dict[str, List[dict]]:
+    cursor = db.surgeries.find({"doctor_id": doctor_id}).sort("date", 1)
+    surgeries: List[dict] = []
+    async for doc in cursor:
+        surgeries.append(serialize_doc(doc))
+    return {"surgeries": surgeries}
+
+
+@app.put("/surgeries/update/{surgery_id}")
+async def update_surgery(surgery_id: str, payload: SurgeryUpdatePayload) -> dict:
+    updates = payload.model_dump(exclude_unset=True, exclude_none=True)
+    performed_by = updates.pop("performed_by", None)
+    if not updates:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No updates provided.")
+
+    updates["updated_at"] = current_timestamp()
+
+    object_id = to_object_id(surgery_id)
+    result = await db.surgeries.update_one({"_id": object_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Surgery not found.")
+
+    record = await db.surgeries.find_one({"_id": object_id})
+    await log_activity(
+        "surgeries.update",
+        performed_by,
+        {"surgery_id": surgery_id, "fields": list(updates.keys())},
+    )
+    return serialize_doc(record)
+
+
+@app.get("/published/{patient_id}")
+async def fetch_published_plans(patient_id: str) -> Dict[str, List[dict]]:
+    cursor = db.published_plans.find({"patient_id": patient_id}).sort("created_at", -1)
+    items: List[dict] = []
+    async for doc in cursor:
+        items.append(serialize_doc(doc))
+    return {"plans": items}
+
+
 @app.post("/publish")
 async def publish_plan(data: PublishPayload):
-    confirmations = []
+    try:
+        record = data.model_dump()
+        now = current_timestamp()
+        record["created_at"] = now
+        record["status"] = "Published"
+        if not record.get("tab"):
+            record["tab"] = "preop"
 
-    for contact in data.contacts:
-        confirmations.append(
-            f"📧 Confirmation sent to {contact.name} ({contact.role}) at {contact.email} for patient {data.patient_id}."
+        insert_result = await db.published_plans.insert_one(record)
+        saved = await db.published_plans.find_one({"_id": insert_result.inserted_id})
+
+        await log_activity(
+            "publish_plan",
+            data.doctor_id,
+            {
+                "plan_id": data.plan_id,
+                "published_at": now,
+                "record_id": str(insert_result.inserted_id),
+                "tab": data.tab or "preop",
+            },
         )
 
-    return {
-        "status": "Published",
-        "patient_id": data.patient_id,
-        "confirmations": confirmations,
-        "ot_booked": True,
-        "ot_id": data.ot_id
-    }
+        return {
+            "message": "Plan published successfully",
+            "plan_id": str(insert_result.inserted_id),
+            "plan": serialize_doc(saved),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Publish failed",
+        ) from exc
+
+
+@app.get("/publish/{record_id}")
+async def fetch_published_plan(record_id: str) -> dict:
+    try:
+        doc = await db.published_plans.find_one({"_id": to_object_id(record_id)})
+    except HTTPException:
+        raise
+    except Exception as exc:  # fallback for invalid ids
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid plan identifier") from exc
+
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+    return serialize_doc(doc)
 
 
 
