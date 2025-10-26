@@ -71,6 +71,7 @@ const PlanDetail = ({ token, doctorId }) => {
   }, [plan]);
 
   const vitals = plan?.vitals || {};
+  const planTab = (plan?.tab || "preop").toUpperCase();
 
   return (
     <div className="space-y-6">
@@ -101,7 +102,8 @@ const PlanDetail = ({ token, doctorId }) => {
               <p className="mt-1 text-sm text-slate-500">
                 Published by {doctorId || plan?.doctor_id || "CareSync doctor"} on
                 {" "}
-                {plan?.timestamp ? new Date(plan.timestamp).toLocaleString() : "recently"}.
+                {plan?.timestamp ? new Date(plan.timestamp).toLocaleString() : "recently"}
+                {" "}· Tab {planTab}.
               </p>
             </div>
 
@@ -265,4 +267,3 @@ const SectionHeading = ({ title, subtitle }) => (
 );
 
 export default PlanDetail;
-
