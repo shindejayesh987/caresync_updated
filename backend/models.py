@@ -101,6 +101,7 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str = Field(min_length=8, max_length=72)
+    roles: Optional[List[str]] = None
 
 
 class UserLogin(BaseModel):
@@ -110,6 +111,7 @@ class UserLogin(BaseModel):
 
 class UserResponse(UserBase):
     id: str
+    roles: List[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -123,12 +125,7 @@ class TokenResponse(BaseModel):
 class LogoutPayload(BaseModel):
     user_id: Optional[str] = None
     email: Optional[EmailStr] = None
-
-    @model_validator(mode="after")
-    def validate_identifier(self):
-        if not (self.user_id or self.email):
-            raise ValueError("Either user_id or email must be provided")
-        return self
+    session_token: Optional[str] = None
 
 
 class ChangePasswordPayload(BaseModel):
