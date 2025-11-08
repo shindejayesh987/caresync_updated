@@ -125,15 +125,22 @@ class AuthService:
         return TokenResponse(access_token=token, user=self._to_user_response(user_doc))
 
     async def logout(self, payload: LogoutPayload, request: Request, current_user: Dict) -> Dict[str, str]:
-        query: Dict[str, object] = {}
-        if payload.user_id:
-            query["_id"] = to_object_id(payload.user_id)
-        if payload.email:
-            query["email"] = payload.email.lower()
-        if not query:
-            query["_id"] = current_user["_id"]
+        current_user_id = current_user.get("_id")
+        current_user_email = (current_user.get("email") or "").lower()
+        if not current_user_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User context missing")
 
-        user_doc = await self._users.find_one(query)
+        current_user_id_str = str(current_user_id)
+        if payload.user_id and payload.user_id != current_user_id_str:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot log out other users")
+        if payload.email and payload.email.lower() != current_user_email:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot log out other users")
+
+        user_query: Dict[str, object] = {"_id": current_user_id}
+        if isinstance(current_user_id, str):
+            user_query["_id"] = to_object_id(current_user_id)
+
+        user_doc = await self._users.find_one(user_query)
         if not user_doc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
@@ -141,20 +148,26 @@ class AuthService:
         fingerprint_to_remove: Optional[str] = None
         if payload.session_token:
             token_data = decode_access_token(payload.session_token)
+            token_user = str(token_data.get("sub"))
+            if token_user != str(user_doc["_id"]):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot clear sessions for another user")
             fingerprint_to_remove = hash_session_identifier(token_data["sid"])
         else:
             request_fingerprint = getattr(request.state, "session_fingerprint", None)
-            if request_fingerprint and user_doc["_id"] == current_user["_id"]:
+            if request_fingerprint and str(user_doc["_id"]) == current_user_id_str:
                 fingerprint_to_remove = request_fingerprint
 
-        if fingerprint_to_remove:
-            active_sessions = [
-                session
-                for session in user_doc.get("active_sessions", []) or []
-                if session.get("fingerprint") != fingerprint_to_remove
-            ]
-        else:
-            active_sessions = []
+        if not fingerprint_to_remove:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A valid session token or current session fingerprint is required to logout",
+            )
+
+        active_sessions = [
+            session
+            for session in user_doc.get("active_sessions", []) or []
+            if session.get("fingerprint") != fingerprint_to_remove
+        ]
 
         await self._users.update_user(
             {"_id": user_doc["_id"]},

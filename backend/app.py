@@ -59,6 +59,8 @@ def create_app() -> FastAPI:
     async def startup_db_client() -> None:
         database = await db_manager.connect()
         app.state.db = database
+        # Ensure email uniqueness is enforced at the database level.
+        await database.users.create_index("email", unique=True)
         user_repo = UserRepository(database)
         audit_service = AuditService(database)
         auth_service = AuthService(user_repo, audit_service)
