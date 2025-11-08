@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from fastapi import Depends, Request
 
+from fastapi import Depends, Request
+
 from backend.repositories.care_repository import CareRepository
 from backend.repositories.scheduling_repository import SchedulingRepository
 from backend.repositories.user_repository import UserRepository
+from backend.services.ai import AIOptimizationService, OptimizedAvailabilityService
 from backend.services.audit import AuditService
 from backend.services.auth import AuthService
 from backend.services.availability import AvailabilityService
@@ -45,6 +48,29 @@ def get_availability_service(
     repository: SchedulingRepository = Depends(get_scheduling_repository),
 ) -> AvailabilityService:
     return AvailabilityService(repository)
+
+
+def get_ai_service(request: Request) -> AIOptimizationService:
+    service = getattr(request.app.state, "ai_service", None)
+    if service is None:
+        db = get_database(request)
+        repository = SchedulingRepository(db)
+        service = AIOptimizationService(repository)
+        request.app.state.ai_service = service
+    return service
+
+
+def get_optimized_availability_service(request: Request) -> OptimizedAvailabilityService:
+    service = getattr(request.app.state, "optimized_availability_service", None)
+    if service is None:
+        db = get_database(request)
+        repository = SchedulingRepository(db)
+        availability_service = AvailabilityService(repository)
+        audit_service = AuditService(db)
+        ai_service = get_ai_service(request)
+        service = OptimizedAvailabilityService(availability_service, ai_service, repository, audit_service)
+        request.app.state.optimized_availability_service = service
+    return service
 
 
 def get_care_service(

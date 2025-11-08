@@ -160,10 +160,19 @@ class CareService:
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Publish failed") from exc
 
+        audit_payload = {
+            "plan_id": payload.plan_id,
+            "published_at": now,
+            "record_id": str(insert_result.inserted_id),
+            "tab": record["tab"],
+        }
+        if payload.optimization_insights:
+            audit_payload["optimization"] = payload.optimization_insights
+
         await self._audit.log_activity(
             "publish_plan",
             performed_by,
-            {"plan_id": payload.plan_id, "published_at": now, "record_id": str(insert_result.inserted_id), "tab": record["tab"]},
+            audit_payload,
         )
         return {
             "message": "Plan published successfully",

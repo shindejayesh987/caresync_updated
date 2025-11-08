@@ -59,6 +59,12 @@ export const changePassword = (payload, token) =>
 export const requestAvailability = (payload, token) =>
   request("/availability", { method: "POST", body: payload, token });
 
+export const requestOptimizedAvailability = (payload, token) =>
+  request("/availability/optimized", { method: "POST", body: payload, token });
+
+export const submitOptimizationFeedback = (payload, token) =>
+  request("/availability/optimized/feedback", { method: "POST", body: payload, token });
+
 export const publishPlan = (payload, token) =>
   request("/publish", { method: "POST", body: payload, token });
 
