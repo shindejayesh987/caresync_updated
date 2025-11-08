@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from datetime import datetime
 from typing import List, Optional
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -54,3 +55,17 @@ class SchedulingRepository:
         resource_name = document.get(name) or str(resource_id)
         resource_email = document.get(email_field) if email_field else document.get("email")
         return Resource(id=str(resource_id), name=resource_name, email=resource_email)
+
+    async def save_optimization_snapshot(self, document: dict) -> None:
+        await self._db.optimization_snapshots.update_one(
+            {"request_key": document["request_key"]},
+            {"$set": document},
+            upsert=True,
+        )
+
+    async def save_optimization_feedback(self, document: dict) -> None:
+        await self._db.optimization_feedback.insert_one(document)
+
+    async def fetch_recent_feedback(self, since: datetime) -> List[dict]:
+        cursor = self._db.optimization_feedback.find({"submitted_at": {"$gte": since}})
+        return [doc async for doc in cursor]

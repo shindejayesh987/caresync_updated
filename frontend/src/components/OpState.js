@@ -2,12 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useNavigate } from "react-router-dom";
 import Task from "./Task";
 import {
-    requestAvailability,
     publishPlan,
     fetchTasks,
     fetchCrew,
     updateTasks,
     updateCrew,
+    requestOptimizedAvailability,
+    submitOptimizationFeedback,
 } from "../services/api";
 import PublishSuccessEnhanced from "./PublishSuccessEnhanced";
 
@@ -74,36 +75,71 @@ const initialPostOpNurseTasks = {
 };
 const PRIORITY_OPTIONS = ["Routine", "High", "Critical"];
 
-const normalizeSuggestions = (data) => {
-    const wrap = (list = [], prefix) =>
-        list.map((item, index) => {
-            const baseName =
-                item.name ||
-                item.nurse_name ||
-                item.email ||
-                item.equipment_name ||
-                item.ot_id ||
-                `${prefix}-${index + 1}`;
-            return {
-                ...item,
-                id: item.id || `${prefix}-${index}-${baseName}`,
-                name: baseName,
-            };
-        });
+const wrapResources = (list = [], prefix) =>
+    list.map((item, index) => {
+        const baseName =
+            item.name ||
+            item.nurse_name ||
+            item.email ||
+            item.equipment_name ||
+            item.ot_id ||
+            `${prefix}-${index + 1}`;
+        return {
+            ...item,
+            id: item.id || `${prefix}-${index}-${baseName}`,
+            name: baseName,
+        };
+    });
+
+const buildScenarioSuggestion = (scenario, baseline = {}) => {
+    if (!scenario) return null;
+    return {
+        nurses: wrapResources(scenario.nurses, "nurse"),
+        assistantDoctors: wrapResources(scenario.assistant_doctors, "assistant"),
+        radiologists: wrapResources(scenario.radiologists, "radiologist"),
+        equipment: wrapResources(scenario.equipment, "equipment"),
+        operationTheatres: wrapResources(scenario.operation_rooms, "ot"),
+        tests: baseline.latest_test_scores || [],
+        meta: {
+            date: baseline.date,
+            start: baseline.start,
+            end: baseline.end,
+            matchStatus: baseline.match_status,
+            scenarioLabel: scenario.label,
+            generatedAt: scenario.generated_at,
+        },
+        metrics: {
+            coverageScore: scenario.metrics?.coverage_score ?? 0,
+            predictedOvertimeMinutes: scenario.metrics?.predicted_overtime_minutes ?? 0,
+            confidence: scenario.metrics?.confidence ?? 0,
+            reasoning: scenario.metrics?.reasoning || [],
+            reasonCodes: scenario.metrics?.reason_codes || [],
+        },
+    };
+};
+
+const normalizeOptimizationResponse = (data) => {
+    const baseline = data?.baseline || {};
+    const scenarios = (data?.scenarios || []).map((scenario) => ({
+        scenarioId: scenario.scenario_id,
+        label: scenario.label,
+        generatedAt: scenario.generated_at,
+        metrics: {
+            coverageScore: scenario.metrics?.coverage_score ?? 0,
+            predictedOvertimeMinutes: scenario.metrics?.predicted_overtime_minutes ?? 0,
+            confidence: scenario.metrics?.confidence ?? 0,
+            reasoning: scenario.metrics?.reasoning || [],
+            reasonCodes: scenario.metrics?.reason_codes || [],
+        },
+        resources: buildScenarioSuggestion(scenario, baseline),
+    }));
 
     return {
-        nurses: wrap(data?.nurses_available, "nurse"),
-        assistantDoctors: wrap(data?.assistant_doctors_available, "assistant"),
-        radiologists: wrap(data?.radiologists_available, "radiologist"),
-        equipment: wrap(data?.equipment_available, "equipment"),
-        operationTheatres: wrap(data?.operation_theatres_available, "ot"),
-        tests: data?.latest_test_scores || [],
-        meta: {
-            date: data?.date,
-            start: data?.start,
-            end: data?.end,
-            matchStatus: data?.match_status,
-        },
+        requestKey: data?.request_key,
+        cached: Boolean(data?.cached),
+        cacheExpiresAt: data?.cache_expires_at,
+        baseline,
+        scenarios,
     };
 };
 
@@ -155,43 +191,32 @@ const deriveMatchStatus = (suggestions) => {
         return { message: "Awaiting AI data", success: null, missing: [] };
     }
 
-    const backendStatus = suggestions.meta?.matchStatus;
-    if (backendStatus) {
-        const normalized = backendStatus.toLowerCase();
-        return {
-            message: backendStatus,
-            success: normalized.includes("matched"),
-            missing: [],
-        };
-    }
-
-    const requirements = defaultAvailabilityPayload;
+    const metrics = suggestions.metrics || {};
+    const coverageScore = metrics.coverageScore ?? 0;
+    const coveragePct = Math.round(coverageScore * 100);
+    const success = coverageScore >= 1;
     const missing = [];
 
-    if ((suggestions.nurses || []).length < requirements.required_nurses) {
-        missing.push("Nurses");
+    if (!success) {
+        missing.push("Staffing coverage");
     }
-    if ((suggestions.assistantDoctors || []).length < requirements.required_assistant_doctors) {
-        missing.push("Assistant doctors");
+    if ((metrics.reasonCodes || []).includes("EQUIPMENT_GAP")) {
+        missing.push("Equipment availability");
     }
-    if ((suggestions.radiologists || []).length < requirements.required_radiologists) {
-        missing.push("Radiologists");
-    }
-    if ((suggestions.operationTheatres || []).length < requirements.required_operation_rooms) {
-        missing.push("Operating rooms");
-    }
-    if (
-        requirements.required_equipment &&
-        !(suggestions.equipment || []).some(
-            (item) => item.name?.toLowerCase() === requirements.required_equipment.toLowerCase()
-        )
-    ) {
-        missing.push(`Equipment: ${requirements.required_equipment}`);
+    if ((metrics.predictedOvertimeMinutes || 0) > 30) {
+        missing.push("Overtime risk");
     }
 
+    const backendStatus = suggestions.meta?.matchStatus;
+    const message = backendStatus
+        ? backendStatus
+        : success
+        ? `Coverage score ${coveragePct}%`
+        : `Coverage ${coveragePct}% – verify staffing`;
+
     return {
-        message: missing.length ? "Requirements not met" : "Requirements matched",
-        success: missing.length === 0,
+        message,
+        success: success && !missing.includes("Equipment availability") && !missing.includes("Overtime risk"),
         missing,
     };
 };
@@ -210,6 +235,11 @@ const OpState = ({
     const [aiSuggestions, setAiSuggestions] = useState(null);
     const [aiError, setAiError] = useState("");
     const [aiPlan, setAiPlan] = useState(null);
+    const [optimizationResult, setOptimizationResult] = useState(null);
+    const [activeScenarioId, setActiveScenarioId] = useState(null);
+    const [scenarioDecision, setScenarioDecision] = useState("accept");
+    const [scenarioFeedback, setScenarioFeedback] = useState("");
+    const [submittingFeedback, setSubmittingFeedback] = useState(false);
     const [matchStatus, setMatchStatus] = useState(null);
     const [selectedCrewForSuggestion, setSelectedCrewForSuggestion] = useState({});
     const [selectedPlanTasks, setSelectedPlanTasks] = useState({});
@@ -316,6 +346,15 @@ const OpState = ({
             toastTimeoutRef.current = null;
         }, 3000);
     }, [setToast]);
+
+    const activeScenario = useMemo(() => {
+        if (!optimizationResult?.scenarios?.length || !activeScenarioId) {
+            return null;
+        }
+        return (
+            optimizationResult.scenarios.find((scenario) => scenario.scenarioId === activeScenarioId) || null
+        );
+    }, [optimizationResult, activeScenarioId]);
 
     const applyTaskSnapshot = useCallback((docs = []) => {
         if (!Array.isArray(docs) || docs.length === 0) {
@@ -606,10 +645,23 @@ const OpState = ({
     const handleFetchAISuggestions = async () => {
         setLoading(true);
         setAiError("");
-            try {
-            const data = await requestAvailability(defaultAvailabilityPayload, token);
-            const normalized = normalizeSuggestions(data);
-            setSuggestions(normalized);
+        try {
+            const payload = {
+                ...defaultAvailabilityPayload,
+                patient_id: patientId || undefined,
+            };
+            const data = await requestOptimizedAvailability(payload, token);
+            const normalized = normalizeOptimizationResponse(data);
+            setOptimizationResult(normalized);
+
+            const firstScenario = normalized.scenarios?.[0];
+            if (firstScenario) {
+                setActiveScenarioId(firstScenario.scenarioId);
+                setSuggestions(firstScenario.resources);
+            } else {
+                setActiveScenarioId(null);
+                setSuggestions(null);
+            }
 
             const llmRes = await fetch("/files/ai.json");
             if (llmRes.ok) {
@@ -619,10 +671,14 @@ const OpState = ({
                 setAiPlan(null);
             }
 
+            setScenarioDecision("accept");
+            setScenarioFeedback("");
             setSelectedCrewForSuggestion({});
             setSelectedPlanTasks({});
         } catch (err) {
             console.error("AI Suggestion fetch failed:", err);
+            setOptimizationResult(null);
+            setActiveScenarioId(null);
             setSuggestions(null);
             setAiPlan(null);
             setAiError(err.message || "Failed to load suggestions.");
@@ -630,6 +686,61 @@ const OpState = ({
             setLoading(false);
         }
     };
+
+    const handleScenarioSelect = useCallback(
+        (scenarioId) => {
+            setActiveScenarioId(scenarioId);
+            const scenario = optimizationResult?.scenarios?.find(
+                (item) => item.scenarioId === scenarioId
+            );
+            if (scenario?.resources) {
+                setSuggestions(scenario.resources);
+            } else {
+                setSuggestions(null);
+            }
+            setScenarioDecision("accept");
+            setScenarioFeedback("");
+            setSelectedCrewForSuggestion({});
+        },
+        [optimizationResult, setSelectedCrewForSuggestion]
+    );
+
+    const handleSubmitScenarioFeedback = useCallback(async () => {
+        if (!optimizationResult?.requestKey || !activeScenarioId) {
+            showToast("Fetch AI recommendations before logging a decision.", "error");
+            return;
+        }
+        setSubmittingFeedback(true);
+        try {
+            await submitOptimizationFeedback(
+                {
+                    request_key: optimizationResult.requestKey,
+                    scenario_id: activeScenarioId,
+                    accepted: scenarioDecision !== "override",
+                    feedback_notes: scenarioFeedback || undefined,
+                    override_summary:
+                        scenarioDecision === "override"
+                            ? scenarioFeedback || "Override recorded without additional detail"
+                            : undefined,
+                },
+                token
+            );
+            showToast("Decision logged for optimisation scenario.");
+        } catch (err) {
+            console.error("Failed to submit optimisation feedback", err);
+            showToast(err.message || "Unable to record decision.", "error");
+        } finally {
+            setSubmittingFeedback(false);
+        }
+    }, [
+        activeScenarioId,
+        optimizationResult,
+        scenarioDecision,
+        scenarioFeedback,
+        showToast,
+        submitOptimizationFeedback,
+        token,
+    ]);
 
     const toggleResourceSelection = (category, id) => {
         setSelectedCrewForSuggestion((prev) => {
@@ -843,6 +954,18 @@ const OpState = ({
                 timestamp: new Date().toISOString(),
                 tab: tabLabel,
             };
+
+            if (optimizationResult?.requestKey && activeScenario) {
+                payload.optimization_insights = {
+                    request_key: optimizationResult.requestKey,
+                    scenario_id: activeScenario.scenarioId,
+                    coverage_score: activeScenario.metrics?.coverageScore ?? null,
+                    confidence: activeScenario.metrics?.confidence ?? null,
+                    reason_codes: activeScenario.metrics?.reasonCodes || [],
+                    decision: scenarioDecision,
+                    feedback_notes: scenarioFeedback || undefined,
+                };
+            }
 
             setPublishing(true);
             try {
@@ -1251,214 +1374,371 @@ const OpState = ({
 
 
 
-    const renderAiPanel = () => (
-        <div className="col-span-1 bg-gray-50 rounded-xl border border-gray-200 flex flex-col max-h-[calc(100vh-140px)]">
-            <div className="overflow-y-auto px-4 pt-4 pb-2 space-y-4 text-sm text-gray-800">
-                <h3 className="text-md font-semibold text-gray-800 mb-3">AI Suggestions</h3>
+    const renderAiPanel = () => {
+        const metrics = activeScenario?.metrics || {};
+        const coveragePct = Math.round((metrics.coverageScore || 0) * 100);
+        const confidencePct = Math.round((metrics.confidence || 0) * 100);
+        const overtimeMinutes = metrics.predictedOvertimeMinutes || 0;
+        const reasonCodes = metrics.reasonCodes || [];
+        const reasoning = metrics.reasoning || [];
+        const cacheExpiryLabel = optimizationResult?.cacheExpiresAt
+            ? new Date(optimizationResult.cacheExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+            : null;
 
-                {loading && <p className="text-sm text-gray-500 mb-6">Loading...</p>}
+        return (
+            <div className="col-span-1 bg-gray-50 rounded-xl border border-gray-200 flex flex-col max-h-[calc(100vh-140px)]">
+                <div className="overflow-y-auto px-4 pt-4 pb-2 space-y-4 text-sm text-gray-800">
+                    <h3 className="text-md font-semibold text-gray-800 mb-3">AI Suggestions</h3>
 
-                {!aiPlan && !aiSuggestions && !loading && (
-                    <p className="text-sm text-gray-500 mb-6">Suggestions will appear here...</p>
-                )}
+                    {loading && <p className="text-sm text-gray-500 mb-6">Loading...</p>}
 
-                {aiPlan && (
-                    <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-                        <div className="flex items-center justify-between">
-                            <div>
-                                <h4 className="text-sm font-semibold text-slate-900">AI Surgical Plan</h4>
-                                <p className="text-xs text-slate-400">Urgency: {aiPlan.urgency}</p>
-                            </div>
-                            {aiPlan.tests?.length > 0 && (
-                                <div className="flex flex-wrap gap-2">
-                                    {aiPlan.tests.map((test) => (
-                                        <span
-                                            key={test}
-                                            className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500"
-                                        >
-                                            {test}
-                                        </span>
-                                    ))}
+                    {!aiPlan && !aiSuggestions && !loading && (
+                        <p className="text-sm text-gray-500 mb-6">Suggestions will appear here...</p>
+                    )}
+
+                    {aiPlan && (
+                        <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <h4 className="text-sm font-semibold text-slate-900">AI Surgical Plan</h4>
+                                    <p className="text-xs text-slate-400">Urgency: {aiPlan.urgency}</p>
                                 </div>
+                                {aiPlan.tests?.length > 0 && (
+                                    <div className="flex flex-wrap gap-2">
+                                        {aiPlan.tests.map((test) => (
+                                            <span
+                                                key={test}
+                                                className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500"
+                                            >
+                                                {test}
+                                            </span>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                            <p className="mt-3 text-sm text-slate-600">{aiPlan.summary}</p>
+                            <div className="mt-4 space-y-3">
+                                {aiPlan.steps.map((step) => (
+                                    <div key={step.id} className="flex flex-col gap-2 rounded-2xl border border-slate-100 bg-slate-50 px-3 py-3">
+                                        <div className="flex items-center justify-between gap-3">
+                                            <div>
+                                                <p className="text-sm font-medium text-slate-900">{step.title}</p>
+                                                <p className="text-xs text-slate-400">Suggested: {step.suggestedRole}</p>
+                                            </div>
+                                            <select
+                                                value={selectedPlanTasks[step.id] || ""}
+                                                onChange={(e) => handlePlanTaskSelection(step.id, e.target.value)}
+                                                className="rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                                            >
+                                                <option value="">Assign</option>
+                                                {globalAssigneeOptions.map((option) => (
+                                                    <option key={option} value={option}>
+                                                        {option}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                        <p className="text-xs text-slate-500">{step.detail}</p>
+                                    </div>
+                                ))}
+                            </div>
+                            <div className="mt-4 flex justify-end">
+                                <button
+                                    type="button"
+                                    onClick={handleApplyPlanSteps}
+                                    className="rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow hover:bg-emerald-500"
+                                >
+                                    Add selected steps
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {optimizationResult?.scenarios?.length > 0 && (
+                        <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                            <div className="flex items-center justify-between">
+                                <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                    Recommendation Scenarios
+                                </h4>
+                                <span className="text-[10px] uppercase tracking-wider text-slate-300">
+                                    {optimizationResult.scenarios.length} option{optimizationResult.scenarios.length > 1 ? "s" : ""}
+                                </span>
+                            </div>
+                            <div className="mt-3 space-y-2">
+                                {optimizationResult.scenarios.map((scenario) => {
+                                    const isActive = scenario.scenarioId === activeScenarioId;
+                                    return (
+                                        <button
+                                            key={scenario.scenarioId}
+                                            type="button"
+                                            onClick={() => handleScenarioSelect(scenario.scenarioId)}
+                                            className={`w-full rounded-2xl border px-3 py-2 text-left text-sm transition ${
+                                                isActive
+                                                    ? "border-emerald-300 bg-emerald-50 text-emerald-700 shadow-sm"
+                                                    : "border-slate-200 text-slate-600 hover:border-emerald-200 hover:bg-emerald-50"
+                                            }`}
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <span className="font-semibold">{scenario.label}</span>
+                                                <span className="text-xs text-slate-400">
+                                                    {scenario.generatedAt &&
+                                                        new Date(scenario.generatedAt).toLocaleTimeString([], {
+                                                            hour: "2-digit",
+                                                            minute: "2-digit",
+                                                        })}
+                                                </span>
+                                            </div>
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                            {optimizationResult.cached && (
+                                <p className="mt-3 text-xs text-slate-400">
+                                    Cached recommendation{cacheExpiryLabel ? ` · refresh after ${cacheExpiryLabel}` : ""}.
+                                </p>
                             )}
                         </div>
-                        <p className="mt-3 text-sm text-slate-600">{aiPlan.summary}</p>
-                        <div className="mt-4 space-y-3">
-                            {aiPlan.steps.map((step) => (
-                                <div key={step.id} className="flex flex-col gap-2 rounded-2xl border border-slate-100 bg-slate-50 px-3 py-3">
-                                    <div className="flex items-center justify-between gap-3">
-                                        <div>
-                                            <p className="text-sm font-medium text-slate-900">{step.title}</p>
-                                            <p className="text-xs text-slate-400">Suggested: {step.suggestedRole}</p>
-                                        </div>
-                                        <select
-                                            value={selectedPlanTasks[step.id] || ""}
-                                            onChange={(e) => handlePlanTaskSelection(step.id, e.target.value)}
-                                            className="rounded-lg border border-slate-200 px-3 py-2 text-xs text-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-200"
-                                        >
-                                            <option value="">Assign</option>
-                                            {globalAssigneeOptions.map((option) => (
-                                                <option key={option} value={option}>
-                                                    {option}
-                                                </option>
-                                            ))}
-                                        </select>
-                                    </div>
-                                    <p className="text-xs text-slate-500">{step.detail}</p>
+                    )}
+
+                    {activeScenario && (
+                        <div className="space-y-4">
+                            <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                <div className="flex items-center justify-between">
+                                    <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                        Scenario Metrics
+                                    </h4>
+                                    <span className="text-[10px] uppercase tracking-wider text-slate-300">
+                                        {activeScenario.label}
+                                    </span>
                                 </div>
-                            ))}
-                        </div>
-                        <div className="mt-4 flex justify-end">
-                            <button
-                                type="button"
-                                onClick={handleApplyPlanSteps}
-                                className="rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow hover:bg-emerald-500"
-                            >
-                                Add selected steps
-                            </button>
-                        </div>
-                    </div>
-                )}
-
-                {aiSuggestions && !aiError && (
-                    <div className="space-y-4">
-                        <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-                            <div className="font-semibold text-xs uppercase tracking-wide text-slate-400">
-                                Window
-                            </div>
-                            <div className="mt-2 text-sm text-slate-600">
-                                <p>📅 {aiSuggestions.meta?.date}</p>
-                                <p>⏰ {aiSuggestions.meta?.start} – {aiSuggestions.meta?.end}</p>
-                            </div>
-                        </div>
-
-                        {suggestionCategories.map(({ key, label }) => {
-                            const list = aiSuggestions[key] || [];
-                            if (!list.length) return null;
-                            const selectedIds = new Set(selectedCrewForSuggestion[key] || []);
-                            return (
-                                <div key={key} className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-                                    <div className="flex items-center justify-between">
-                                        <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                                            {label}
-                                        </h4>
-                                        <span className="text-[10px] uppercase tracking-wider text-slate-300">
-                                            {list.length} option{list.length > 1 ? "s" : ""}
-                                        </span>
+                                <div className="mt-3 grid grid-cols-3 gap-2 text-xs text-slate-600">
+                                    <div className="rounded-2xl bg-emerald-50 px-3 py-2">
+                                        <p className="text-[10px] uppercase tracking-wide text-emerald-500">Coverage</p>
+                                        <p className="text-sm font-semibold text-emerald-700">{coveragePct}%</p>
                                     </div>
-                                    <div className="mt-3 space-y-2">
-                                        {list.map((item) => (
-                                            <div
-                                                key={item.id}
-                                                className={`flex items-start justify-between gap-3 rounded-2xl border px-3 py-2 transition ${
-                                                    selectedIds.has(item.id)
-                                                        ? "border-emerald-300 bg-emerald-50 shadow-sm"
-                                                        : "border-slate-200 hover:border-emerald-200 hover:bg-emerald-50 hover:bg-opacity-50"
-                                                }`}
+                                    <div className="rounded-2xl bg-blue-50 px-3 py-2">
+                                        <p className="text-[10px] uppercase tracking-wide text-blue-500">Confidence</p>
+                                        <p className="text-sm font-semibold text-blue-700">{confidencePct}%</p>
+                                    </div>
+                                    <div className="rounded-2xl bg-amber-50 px-3 py-2">
+                                        <p className="text-[10px] uppercase tracking-wide text-amber-500">Pred. OT</p>
+                                        <p className="text-sm font-semibold text-amber-700">{overtimeMinutes}m</p>
+                                    </div>
+                                </div>
+                                {reasonCodes.length > 0 && (
+                                    <div className="mt-3 flex flex-wrap gap-2">
+                                        {reasonCodes.map((code) => (
+                                            <span
+                                                key={code}
+                                                className="rounded-full bg-slate-100 px-3 py-1 text-[10px] uppercase tracking-wide text-slate-500"
                                             >
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-900">{item.name}</p>
-                                                    {item.email && <p className="text-xs text-slate-400">{item.email}</p>}
+                                                {code.replace(/_/g, " ")}
+                                            </span>
+                                        ))}
+                                    </div>
+                                )}
+                                {reasoning.length > 0 && (
+                                    <ul className="mt-3 list-disc space-y-1 pl-5 text-xs text-slate-500">
+                                        {reasoning.map((item, index) => (
+                                            <li key={index}>{item}</li>
+                                        ))}
+                                    </ul>
+                                )}
+                            </div>
+
+                            <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                    Clinician Decision
+                                </h4>
+                                <div className="mt-3 flex flex-col gap-2 text-sm text-slate-600">
+                                    <label className="flex items-center gap-2">
+                                        <input
+                                            type="radio"
+                                            name="scenario-decision"
+                                            value="accept"
+                                            checked={scenarioDecision !== "override"}
+                                            onChange={() => setScenarioDecision("accept")}
+                                        />
+                                        Accept recommendation
+                                    </label>
+                                    <label className="flex items-center gap-2">
+                                        <input
+                                            type="radio"
+                                            name="scenario-decision"
+                                            value="override"
+                                            checked={scenarioDecision === "override"}
+                                            onChange={() => setScenarioDecision("override")}
+                                        />
+                                        Override with manual plan
+                                    </label>
+                                </div>
+                                <textarea
+                                    value={scenarioFeedback}
+                                    onChange={(e) => setScenarioFeedback(e.target.value)}
+                                    rows={scenarioDecision === "override" ? 4 : 3}
+                                    className="mt-3 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm text-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                                    placeholder={
+                                        scenarioDecision === "override"
+                                            ? "Describe your override or concerns..."
+                                            : "Optional notes about this recommendation"
+                                    }
+                                />
+                                <div className="mt-3 flex justify-end">
+                                    <button
+                                        type="button"
+                                        onClick={handleSubmitScenarioFeedback}
+                                        disabled={submittingFeedback}
+                                        className={`rounded-full px-4 py-2 text-xs font-semibold text-white shadow ${
+                                            submittingFeedback
+                                                ? "bg-slate-400"
+                                                : "bg-emerald-600 hover:bg-emerald-500"
+                                        }`}
+                                    >
+                                        {submittingFeedback ? "Saving..." : "Log decision"}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {aiSuggestions && !aiError && (
+                        <div className="space-y-4">
+                            <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                <div className="font-semibold text-xs uppercase tracking-wide text-slate-400">
+                                    Window
+                                </div>
+                                <div className="mt-2 text-sm text-slate-600">
+                                    <p>📅 {aiSuggestions.meta?.date}</p>
+                                    <p>⏰ {aiSuggestions.meta?.start} – {aiSuggestions.meta?.end}</p>
+                                </div>
+                            </div>
+
+                            {suggestionCategories.map(({ key, label }) => {
+                                const list = aiSuggestions[key] || [];
+                                if (!list.length) return null;
+                                const selectedIds = new Set(selectedCrewForSuggestion[key] || []);
+                                return (
+                                    <div key={key} className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                        <div className="flex items-center justify-between">
+                                            <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                                {label}
+                                            </h4>
+                                            <span className="text-[10px] uppercase tracking-wider text-slate-300">
+                                                {list.length} option{list.length > 1 ? "s" : ""}
+                                            </span>
+                                        </div>
+                                        <div className="mt-3 space-y-2">
+                                            {list.map((item) => (
+                                                <div
+                                                    key={item.id}
+                                                    className={`flex items-start justify-between gap-3 rounded-2xl border px-3 py-2 transition ${
+                                                        selectedIds.has(item.id)
+                                                            ? "border-emerald-300 bg-emerald-50 shadow-sm"
+                                                            : "border-slate-200 hover:border-emerald-200 hover:bg-emerald-50 hover:bg-opacity-50"
+                                                    }`}
+                                                >
+                                                    <div>
+                                                        <p className="text-sm font-medium text-slate-900">{item.name}</p>
+                                                        {item.email && <p className="text-xs text-slate-400">{item.email}</p>}
+                                                    </div>
+                                                    <div className="flex items-center gap-2">
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => toggleResourceSelection(key, item.id)}
+                                                            className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${
+                                                                selectedIds.has(item.id)
+                                                                    ? "border-emerald-400 bg-emerald-500 text-white"
+                                                                    : "border-slate-200 text-slate-500 hover:border-emerald-200 hover:text-emerald-600"
+                                                            }`}
+                                                        >
+                                                            {selectedIds.has(item.id) ? "Added" : "Add"}
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleResourceEdit(key, item)}
+                                                            className="text-slate-400 hover:text-emerald-500 text-xs"
+                                                        >
+                                                            Edit
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleResourceRemove(key, item.id)}
+                                                            className="text-red-500 hover:text-red-400"
+                                                        >
+                                                            Remove
+                                                        </button>
+                                                    </div>
                                                 </div>
-                                                <div className="flex items-center gap-2">
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => toggleResourceSelection(key, item.id)}
-                                                        className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${
-                                                            selectedIds.has(item.id)
-                                                                ? "border-emerald-400 bg-emerald-500 text-white"
-                                                                : "border-slate-200 text-slate-500 hover:border-emerald-200 hover:text-emerald-600"
-                                                        }`}
-                                                    >
-                                                        {selectedIds.has(item.id) ? "Added" : "Add"}
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => handleResourceEdit(key, item)}
-                                                        className="text-slate-400 hover:text-emerald-500 text-xs"
-                                                    >
-                                                        Edit
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => handleResourceRemove(key, item.id)}
-                                                        className="text-red-500 hover:text-red-400"
-                                                    >
-                                                        Remove
-                                                    </button>
-                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+
+                            {aiSuggestions.tests?.length > 0 && (
+                                <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+                                    <p className="text-xs uppercase tracking-wide text-slate-400">Latest MRI Tests</p>
+                                    <div className="mt-3 space-y-2 text-xs text-slate-500">
+                                        {aiSuggestions.tests.map((test, index) => (
+                                            <div key={index} className="flex justify-between">
+                                                <span className="font-medium text-slate-700">{test.patient_id}</span>
+                                                <span>{test.score}</span>
                                             </div>
                                         ))}
                                     </div>
                                 </div>
-                            );
-                        })}
+                            )}
 
-                        {aiSuggestions.tests?.length > 0 && (
-                            <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
-                                <p className="text-xs uppercase tracking-wide text-slate-400">Latest MRI Tests</p>
-                                <div className="mt-3 space-y-2 text-xs text-slate-500">
-                                    {aiSuggestions.tests.map((test, index) => (
-                                        <div key={index} className="flex justify-between">
-                                            <span className="font-medium text-slate-700">{test.patient_id}</span>
-                                            <span>{test.score}</span>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-
-                        {matchStatus && (
-                            <div
-                                className={`rounded-3xl border px-4 py-3 text-center text-sm font-semibold shadow-sm ${
-                                    matchStatus.success === null
-                                        ? "border-slate-200 bg-slate-50 text-slate-500"
-                                        : matchStatus.success
-                                        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                        : "border-red-200 bg-red-50 text-red-600"
-                                }`}
-                            >
-                                <p className="font-semibold">
-                                    {matchStatus.success === null
-                                        ? matchStatus.message
-                                        : matchStatus.success
-                                        ? "Requirements matched"
-                                        : "Requirements not met"}
-                                </p>
-                                {!matchStatus.success && matchStatus.missing?.length > 0 && (
-                                    <p className="mt-1 text-xs font-normal text-slate-500">
-                                        Needs: {matchStatus.missing.join(", ")}
+                            {matchStatus && (
+                                <div
+                                    className={`rounded-3xl border px-4 py-3 text-center text-sm font-semibold shadow-sm ${
+                                        matchStatus.success === null
+                                            ? "border-slate-200 bg-slate-50 text-slate-500"
+                                            : matchStatus.success
+                                            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                            : "border-red-200 bg-red-50 text-red-600"
+                                    }`}
+                                >
+                                    <p className="font-semibold">
+                                        {matchStatus.success === null
+                                            ? matchStatus.message
+                                            : matchStatus.success
+                                            ? "Requirements matched"
+                                            : "Requirements not met"}
                                     </p>
-                                )}
-                            </div>
-                        )}
-                    </div>
-                )}
+                                    {!matchStatus.success && matchStatus.missing?.length > 0 && (
+                                        <p className="mt-1 text-xs font-normal text-slate-500">
+                                            Needs: {matchStatus.missing.join(", ")}
+                                        </p>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    )}
 
-                {aiError && (
-                    <p className="text-sm text-red-500">{aiError}</p>
-                )}
-            </div>
+                    {aiError && <p className="text-sm text-red-500">{aiError}</p>}
+                </div>
 
-            <div className="flex justify-center gap-3 p-4 border-t bg-white">
-                <button
-                    onClick={handleFetchAISuggestions}
-                    className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2 px-4 rounded-full shadow"
-                >
-                    AI Suggestion
-                </button>
-                <button
-                    onClick={handleApplySelectedResources}
-                    disabled={!hasSelectedResources}
-                    className={`text-white text-sm font-medium py-2 px-4 rounded-full shadow transition ${
-                        hasSelectedResources ? "bg-blue-600 hover:bg-blue-700" : "bg-blue-300 cursor-not-allowed"
-                    }`}
-                >
-                    Add to Task
-                </button>
+                <div className="flex justify-center gap-3 p-4 border-t bg-white">
+                    <button
+                        onClick={handleFetchAISuggestions}
+                        className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2 px-4 rounded-full shadow"
+                    >
+                        AI Suggestion
+                    </button>
+                    <button
+                        onClick={handleApplySelectedResources}
+                        disabled={!hasSelectedResources}
+                        className={`text-white text-sm font-medium py-2 px-4 rounded-full shadow transition ${
+                            hasSelectedResources ? "bg-blue-600 hover:bg-blue-700" : "bg-blue-300 cursor-not-allowed"
+                        }`}
+                    >
+                        Add to Task
+                    </button>
+                </div>
             </div>
-        </div>
-    );
+        );
+    };
 
     const renderTasksColumn = () => {
         const scope = activeTab || "preop";

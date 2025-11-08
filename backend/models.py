@@ -9,6 +9,7 @@ class TimeWindow(BaseModel):
     end: str
 
 class AvailabilityRequest(BaseModel):
+    patient_id: Optional[str] = None
     requested_date: str
     requested_start: str
     requested_end: str
@@ -34,7 +35,7 @@ class TestScore(BaseModel):
     date: date
 
 class AvailabilityResponse(BaseModel):
-    date: str   
+    date: str
     start: str
     end: str
     radiologists_available: List[Resource]
@@ -44,6 +45,34 @@ class AvailabilityResponse(BaseModel):
     operation_theatres_available: List[Resource]
     latest_test_scores: List[TestScore]
     match_status: str
+
+
+class OptimizationMetrics(BaseModel):
+    coverage_score: float
+    predicted_overtime_minutes: int
+    confidence: float
+    reasoning: List[str] = Field(default_factory=list)
+    reason_codes: List[str] = Field(default_factory=list)
+
+
+class OptimizationScenario(BaseModel):
+    scenario_id: str
+    label: str
+    radiologists: List[Resource]
+    assistant_doctors: List[Resource]
+    nurses: List[Resource]
+    equipment: List[Resource]
+    operation_rooms: List[Resource]
+    metrics: OptimizationMetrics
+    generated_at: datetime
+
+
+class OptimizedAvailabilityResponse(BaseModel):
+    request_key: str
+    cached: bool
+    cache_expires_at: Optional[datetime]
+    baseline: AvailabilityResponse
+    scenarios: List[OptimizationScenario]
 
 
 class StaffDocument(BaseModel):
@@ -93,6 +122,15 @@ class PublishPayload(BaseModel):
     vitals: Dict[str, Any]
     timestamp: datetime
     tab: Optional[str] = None
+    optimization_insights: Optional[Dict[str, Any]] = None
+
+
+class ScenarioFeedbackPayload(BaseModel):
+    request_key: str
+    scenario_id: str
+    accepted: bool
+    feedback_notes: Optional[str] = None
+    override_summary: Optional[str] = None
 
 class UserBase(BaseModel):
     email: EmailStr
