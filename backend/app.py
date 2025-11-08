@@ -8,9 +8,12 @@ from jose import JWTError
 
 from backend.api.routes import auth, care, scheduling
 from backend.db.manager import db_manager
+from backend.repositories.scheduling_repository import SchedulingRepository
 from backend.repositories.user_repository import UserRepository
+from backend.services.ai import AIOptimizationService, OptimizedAvailabilityService, OptimizationScheduler
 from backend.services.audit import AuditService
 from backend.services.auth import AuthService
+from backend.services.availability import AvailabilityService
 
 
 def create_app() -> FastAPI:
@@ -61,8 +64,27 @@ def create_app() -> FastAPI:
         auth_service = AuthService(user_repo, audit_service)
         await auth_service.ensure_default_roles()
 
+        scheduling_repo = SchedulingRepository(database)
+        availability_service = AvailabilityService(scheduling_repo)
+        ai_service = AIOptimizationService(scheduling_repo)
+        optimized_service = OptimizedAvailabilityService(
+            availability_service,
+            ai_service,
+            scheduling_repo,
+            audit_service,
+        )
+        scheduler = OptimizationScheduler(ai_service)
+        scheduler.start()
+
+        app.state.ai_service = ai_service
+        app.state.optimized_availability_service = optimized_service
+        app.state.optimization_scheduler = scheduler
+
     @app.on_event("shutdown")
     async def shutdown_db_client() -> None:
+        scheduler = getattr(app.state, "optimization_scheduler", None)
+        if scheduler is not None:
+            await scheduler.stop()
         await db_manager.close()
 
     app.include_router(auth.router)
