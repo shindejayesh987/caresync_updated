@@ -6,18 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN adduser --disabled-password --gecos "" appuser
-
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY main.py app.py api/ services/ repositories/ models.py config.py security.py db/ seed_db.py ./
-
-RUN chown -R appuser:appuser /app
-
-USER appuser
+COPY . .
 
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+CMD ["python", "main.py"]
